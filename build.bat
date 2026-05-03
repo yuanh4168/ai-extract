@@ -1,0 +1,1 @@
+g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32

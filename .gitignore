@@ -1,0 +1,17 @@
+# 编译产物
+ai-extract.exe
+*.o
+*.out
+
+# 自动生成的备份
+*.zip
+ai_project/
+backup/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
