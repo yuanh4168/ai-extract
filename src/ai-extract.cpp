@@ -1,6 +1,6 @@
 // ai-extract.cpp
-// Version with config, colors, window save, runtime commands.
-// Build: g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32
+// 功能：AI代码提取、提示词链、文件读取/删除、备份等
+// 构建：g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22,9 +22,9 @@
 #include <limits>
 #include <direct.h>
 
-// ----------------------------- color helpers -----------------------
+// ----------------------------- 颜色助手 -----------------------------
 enum class Color {
-    WHITE   = 7,   // default console color
+    WHITE   = 7,
     GREEN   = 10,
     YELLOW  = 14,
     RED     = 12,
@@ -36,25 +36,15 @@ static void setColor(Color c) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, static_cast<WORD>(c));
 }
-
-static void resetColor() {
-    setColor(Color::WHITE);
-}
+static void resetColor() { setColor(Color::WHITE); }
 
 class ColoredOut {
     Color m_color;
 public:
     explicit ColoredOut(Color c) : m_color(c) { setColor(m_color); }
     ~ColoredOut() { resetColor(); }
-    template<typename T>
-    ColoredOut& operator<<(const T& val) {
-        std::cout << val;
-        return *this;
-    }
-    ColoredOut& operator<<(std::ostream& (*pf)(std::ostream&)) {
-        std::cout << pf;
-        return *this;
-    }
+    template<typename T> ColoredOut& operator<<(const T& val) { std::cout << val; return *this; }
+    ColoredOut& operator<<(std::ostream& (*pf)(std::ostream&)) { std::cout << pf; return *this; }
 };
 
 #define CLR_INFO    ColoredOut(Color::WHITE)
@@ -63,16 +53,16 @@ public:
 #define CLR_ERROR   ColoredOut(Color::RED)
 #define CLR_INPUT   ColoredOut(Color::CYAN)
 
-// ----------------------------- config file -------------------------
+// ----------------------------- 配置文件 -----------------------------
 struct Config {
     std::string fileName = "ai-extract.ini";
-    int winLeft = -1, winTop = -1, winWidth = -1, winHeight = -1;
     std::string defaultMode;   // "auto", "loop", "interactive"
-    std::string outDir;
-    std::string startupDir;    // startup working directory
+    std::string outDir;        // 输出目录（默认当前目录）
+    std::string startupDir;    // 启动后切换的工作目录
     bool force = false;
     bool debug = false;
     bool noBackup = false;
+    std::string fileReadMode = "text"; // 读取文件时复制内容还是路径
 
     bool load(const std::string& path) {
         std::ifstream in(path);
@@ -91,38 +81,32 @@ struct Config {
             key.erase(key.find_last_not_of(" \t") + 1);
             val.erase(0, val.find_first_not_of(" \t"));
             val.erase(val.find_last_not_of(" \t") + 1);
-            if (key == "window_left") winLeft = atoi(val.c_str());
-            else if (key == "window_top") winTop = atoi(val.c_str());
-            else if (key == "window_width") winWidth = atoi(val.c_str());
-            else if (key == "window_height") winHeight = atoi(val.c_str());
-            else if (key == "default_mode") defaultMode = val;
+            if (key == "default_mode") defaultMode = val;
             else if (key == "output_dir") outDir = val;
             else if (key == "startup_working_dir") startupDir = val;
             else if (key == "force") force = (val == "1" || val == "true");
             else if (key == "debug") debug = (val == "1" || val == "true");
             else if (key == "no_backup") noBackup = (val == "1" || val == "true");
+            else if (key == "file_read_mode") fileReadMode = val;
         }
         return true;
     }
 
-    void save(const std::string& path, int left, int top, int width, int height) const {
+    void save(const std::string& path) const {
         std::ofstream out(path);
         if (!out) return;
         out << "# ai-extract configuration\n";
-        out << "window_left=" << left << "\n";
-        out << "window_top=" << top << "\n";
-        out << "window_width=" << width << "\n";
-        out << "window_height=" << height << "\n";
         out << "default_mode=" << defaultMode << "\n";
         out << "output_dir=" << outDir << "\n";
         out << "startup_working_dir=" << startupDir << "\n";
         out << "force=" << (force ? "true" : "false") << "\n";
         out << "debug=" << (debug ? "true" : "false") << "\n";
         out << "no_backup=" << (noBackup ? "true" : "false") << "\n";
+        out << "file_read_mode=" << fileReadMode << "\n";
     }
 };
 
-// ----------------------------- utility -----------------------------
+// ----------------------------- 工具函数 -----------------------------
 static std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) return {};
@@ -155,37 +139,43 @@ static std::string escapeForDebug(const std::string& s) {
     return result;
 }
 
-// ----------------------------- clipboard ---------------------------
+// ----------------------------- 剪贴板 ---------------------------
 static std::string readClipboard() {
-    if (!OpenClipboard(nullptr))
-        throw std::runtime_error("Cannot open clipboard");
+    if (!OpenClipboard(nullptr)) throw std::runtime_error("Cannot open clipboard");
     HANDLE hData = GetClipboardData(CF_UNICODETEXT);
-    if (hData == nullptr) {
-        CloseClipboard();
-        throw std::runtime_error("No text on clipboard");
-    }
+    if (hData == nullptr) { CloseClipboard(); throw std::runtime_error("No text on clipboard"); }
     wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
-    if (pszText == nullptr) {
-        CloseClipboard();
-        throw std::runtime_error("Cannot lock clipboard data");
-    }
+    if (pszText == nullptr) { CloseClipboard(); throw std::runtime_error("Cannot lock clipboard data"); }
     std::wstring wstr(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
 
-    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()),
-                                         nullptr, 0, nullptr, nullptr);
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()), nullptr, 0, nullptr, nullptr);
     std::string utf8(sizeNeeded, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()),
-                        &utf8[0], sizeNeeded, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()), &utf8[0], sizeNeeded, nullptr, nullptr);
     return utf8;
 }
 
-// ----------------------------- path helpers (Win32) -----------------
+static void writeClipboard(const std::string& text) {
+    if (!OpenClipboard(nullptr)) { CLR_ERROR << "无法打开剪贴板进行写入\n"; return; }
+    EmptyClipboard();
+    int wideLen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (wideLen <= 0) { CloseClipboard(); CLR_ERROR << "编码转换失败\n"; return; }
+    std::wstring wstr(wideLen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wstr[0], wideLen);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (wstr.size() + 1) * sizeof(wchar_t));
+    if (hMem) {
+        wchar_t* pData = static_cast<wchar_t*>(GlobalLock(hMem));
+        if (pData) { wcscpy(pData, wstr.c_str()); GlobalUnlock(hMem); SetClipboardData(CF_UNICODETEXT, hMem); }
+    }
+    CloseClipboard();
+    CLR_SUCCESS << "已将内容复制到剪贴板\n";
+}
+
+// ----------------------------- 路径辅助 -------------------------
 static std::string getCurrentDir() {
     char buf[MAX_PATH];
-    if (_getcwd(buf, sizeof(buf)))
-        return std::string(buf);
+    if (_getcwd(buf, sizeof(buf))) return std::string(buf);
     return "unknown";
 }
 
@@ -208,26 +198,22 @@ static void makeDirectory(const std::string& path) {
     for (size_t i = 0; i < path.size(); ++i) {
         current.push_back(path[i]);
         if (path[i] == '\\' || path[i] == '/' || i == path.size() - 1) {
-            if (!current.empty() && !directoryExists(current)) {
-                _mkdir(current.c_str());
-            }
+            if (!current.empty() && !directoryExists(current)) _mkdir(current.c_str());
         }
     }
 }
 
 static std::string fullPath(const std::string& relative) {
     char full[MAX_PATH];
-    if (_fullpath(full, relative.c_str(), MAX_PATH))
-        return std::string(full);
+    if (_fullpath(full, relative.c_str(), MAX_PATH)) return std::string(full);
     return relative;
 }
 
-// ----------------------------- parser ------------------------------
+// ----------------------------- 解析器 ------------------------------
 static std::vector<std::pair<std::string, std::string>> parseClipboardText(const std::string& text) {
     std::vector<std::pair<std::string, std::string>> files;
     std::regex splitter(R"(^###FILE:\s*([^\r\n]+))");
     auto lines = splitLines(text);
-
     std::string currentPath;
     std::ostringstream currentContent;
     bool insideFile = false;
@@ -240,28 +226,21 @@ static std::vector<std::pair<std::string, std::string>> parseClipboardText(const
                 std::string content = currentContent.str();
                 auto contentLines = splitLines(content);
                 if (!contentLines.empty()) {
-                    if (trim(contentLines.front()).rfind("```", 0) == 0)
-                        contentLines.erase(contentLines.begin());
-                    if (!contentLines.empty() && trim(contentLines.back()) == "```")
-                        contentLines.pop_back();
+                    if (trim(contentLines.front()).rfind("```", 0) == 0) contentLines.erase(contentLines.begin());
+                    if (!contentLines.empty() && trim(contentLines.back()) == "```") contentLines.pop_back();
                 }
                 std::string cleaned;
-                for (size_t i = 0; i < contentLines.size(); ++i) {
-                    if (i > 0) cleaned += '\n';
-                    cleaned += contentLines[i];
-                }
+                for (size_t i = 0; i < contentLines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += contentLines[i]; }
                 files.emplace_back(currentPath, cleaned);
             }
             currentPath = match[1].str();
             if (currentPath.find("..") != std::string::npos || (!currentPath.empty() && currentPath[0] == '/')) {
                 CLR_WARN << "跳过不安全路径: " << currentPath << "\n";
                 insideFile = false;
-                currentContent.str("");
-                currentContent.clear();
+                currentContent.str(""); currentContent.clear();
                 continue;
             }
-            currentContent.str("");
-            currentContent.clear();
+            currentContent.str(""); currentContent.clear();
             insideFile = true;
         } else if (insideFile) {
             if (currentContent.tellp() > 0) currentContent << '\n';
@@ -272,27 +251,77 @@ static std::vector<std::pair<std::string, std::string>> parseClipboardText(const
         std::string content = currentContent.str();
         auto contentLines = splitLines(content);
         if (!contentLines.empty()) {
-            if (trim(contentLines.front()).rfind("```", 0) == 0)
-                contentLines.erase(contentLines.begin());
-            if (!contentLines.empty() && trim(contentLines.back()) == "```")
-                contentLines.pop_back();
+            if (trim(contentLines.front()).rfind("```", 0) == 0) contentLines.erase(contentLines.begin());
+            if (!contentLines.empty() && trim(contentLines.back()) == "```") contentLines.pop_back();
         }
         std::string cleaned;
-        for (size_t i = 0; i < contentLines.size(); ++i) {
-            if (i > 0) cleaned += '\n';
-            cleaned += contentLines[i];
-        }
+        for (size_t i = 0; i < contentLines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += contentLines[i]; }
         files.emplace_back(currentPath, cleaned);
     }
     return files;
 }
 
-// --------------------- empty body detection ------------------------
-struct Warning {
-    std::string file;
-    int line;
-    std::string description;
+// ---- 解析 ###FILE / ###READ / ###DELETE 指令 ----
+struct FileDirective {
+    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE };
+    Type type;
+    std::string path;
+    std::string content;
 };
+
+static std::vector<FileDirective> parseDirectives(const std::string& text) {
+    std::vector<FileDirective> directives;
+    std::regex re(R"(^###(FILE|READ|DELETE):\s*([^\r\n]+))");
+    auto lines = splitLines(text);
+    std::string currentType;
+    std::string currentPath;
+    std::ostringstream currentContent;
+    bool insideBlock = false;
+
+    for (const auto& line : lines) {
+        std::smatch m;
+        std::string trimmed = trim(line);
+        if (std::regex_match(trimmed, m, re)) {
+            if (insideBlock) {
+                std::string content = currentContent.str();
+                auto clines = splitLines(content);
+                if (!clines.empty() && trim(clines.front()).rfind("```", 0) == 0) clines.erase(clines.begin());
+                if (!clines.empty() && trim(clines.back()) == "```") clines.pop_back();
+                std::string cleaned;
+                for (size_t i = 0; i < clines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += clines[i]; }
+                FileDirective::Type t = FileDirective::CREATE_FILE;
+                if (currentType == "FILE") t = FileDirective::CREATE_FILE;
+                else if (currentType == "READ") t = FileDirective::READ_FILE;
+                else if (currentType == "DELETE") t = FileDirective::DELETE_FILE;
+                directives.push_back({t, currentPath, cleaned});
+            }
+            currentType = m[1].str();
+            currentPath = m[2].str();
+            currentContent.str(""); currentContent.clear();
+            insideBlock = true;
+        } else if (insideBlock) {
+            if (currentContent.tellp() > 0) currentContent << '\n';
+            currentContent << line;
+        }
+    }
+    if (insideBlock) {
+        std::string content = currentContent.str();
+        auto clines = splitLines(content);
+        if (!clines.empty() && trim(clines.front()).rfind("```", 0) == 0) clines.erase(clines.begin());
+        if (!clines.empty() && trim(clines.back()) == "```") clines.pop_back();
+        std::string cleaned;
+        for (size_t i = 0; i < clines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += clines[i]; }
+        FileDirective::Type t = FileDirective::CREATE_FILE;
+        if (currentType == "FILE") t = FileDirective::CREATE_FILE;
+        else if (currentType == "READ") t = FileDirective::READ_FILE;
+        else if (currentType == "DELETE") t = FileDirective::DELETE_FILE;
+        directives.push_back({t, currentPath, cleaned});
+    }
+    return directives;
+}
+
+// --------------------- 空函数检测 ------------------------
+struct Warning { std::string file; int line; std::string description; };
 
 static void detectCStyle(const std::string& file, const std::vector<std::string>& lines,
                          std::vector<Warning>& warnings) {
@@ -306,8 +335,7 @@ static void detectCStyle(const std::string& file, const std::vector<std::string>
             warnings.push_back({file, i + 1, trim(line) + " (empty body, return;)"});
         else if (std::regex_search(line, std::regex(R"(\)\s*\{)")) && line.find('}') == std::string::npos) {
             int j = i + 1;
-            while (j < static_cast<int>(lines.size()) && lines[j].find_first_not_of(" \t\r\n") == std::string::npos)
-                ++j;
+            while (j < static_cast<int>(lines.size()) && lines[j].find_first_not_of(" \t\r\n") == std::string::npos) ++j;
             if (j < static_cast<int>(lines.size()) && trim(lines[j]) == "}")
                 warnings.push_back({file, i + 1, trim(line) + " ... } (empty body)"});
         }
@@ -323,8 +351,7 @@ static void detectPython(const std::string& file, const std::vector<std::string>
             size_t indent = line.find_first_not_of(" \t");
             if (indent == std::string::npos) indent = 0;
             int j = i + 1;
-            while (j < static_cast<int>(lines.size()) && lines[j].find_first_not_of(" \t\r\n") == std::string::npos)
-                ++j;
+            while (j < static_cast<int>(lines.size()) && lines[j].find_first_not_of(" \t\r\n") == std::string::npos) ++j;
             if (j < static_cast<int>(lines.size())) {
                 std::string nextLine = lines[j];
                 std::string nextTrim = trim(nextLine);
@@ -344,18 +371,16 @@ static std::vector<Warning> detectEmptyBodies(const std::vector<std::pair<std::s
         std::string ext;
         size_t dot = path.find_last_of('.');
         if (dot != std::string::npos) ext = path.substr(dot);
-        if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx" ||
-            ext == ".h" || ext == ".hpp" || ext == ".java" || ext == ".cs")
+        if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".h" || ext == ".hpp" || ext == ".java" || ext == ".cs")
             detectCStyle(path, lines, warnings);
-        else if (ext == ".py")
-            detectPython(path, lines, warnings);
+        else if (ext == ".py") detectPython(path, lines, warnings);
         else if (ext == ".js" || ext == ".ts" || ext == ".jsx" || ext == ".tsx" || ext == ".mjs")
             detectCStyle(path, lines, warnings);
     }
     return warnings;
 }
 
-// ----------------------------- backup ------------------------------
+// ----------------------------- 备份 ------------------------------
 static std::string makeTimestamp() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -367,35 +392,20 @@ static std::string makeTimestamp() {
 
 static bool gitBackup(const std::string& targetDir) {
     std::string oldDir = getCurrentDir();
-    if (!SetCurrentDirectoryA(targetDir.c_str())) {
-        CLR_ERROR << "[git] 无法进入目录 " << targetDir << "\n";
-        return false;
-    }
+    if (!SetCurrentDirectoryA(targetDir.c_str())) { CLR_ERROR << "[git] 无法进入目录 " << targetDir << "\n"; return false; }
     if (!directoryExists(".git")) {
-        if (std::system("git init") != 0) {
-            CLR_ERROR << "[git] git init failed\n";
-            SetCurrentDirectoryA(oldDir.c_str());
-            return false;
-        }
+        if (std::system("git init") != 0) { CLR_ERROR << "[git] git init failed\n"; SetCurrentDirectoryA(oldDir.c_str()); return false; }
     }
-    if (std::system("git add -A") != 0) {
-        CLR_ERROR << "[git] git add failed\n";
-        SetCurrentDirectoryA(oldDir.c_str());
-        return false;
-    }
+    if (std::system("git add -A") != 0) { CLR_ERROR << "[git] git add failed\n"; SetCurrentDirectoryA(oldDir.c_str()); return false; }
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm = *std::localtime(&t);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    std::ostringstream oss; oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
     std::string msg = "auto backup at " + oss.str();
     std::string cmd = "git -c user.name=ai-extract -c user.email=ai-extract@local commit -m \"" + msg + "\"";
     int rc = std::system(cmd.c_str());
     SetCurrentDirectoryA(oldDir.c_str());
-    if (rc != 0) {
-        CLR_ERROR << "[git] git commit failed\n";
-        return false;
-    }
+    if (rc != 0) { CLR_ERROR << "[git] git commit failed\n"; return false; }
     CLR_SUCCESS << "[git] committed.\n";
     return true;
 }
@@ -404,23 +414,18 @@ static bool zipBackup(const std::string& targetDir) {
     std::string parent = targetDir;
     while (!parent.empty() && (parent.back() == '/' || parent.back() == '\\')) parent.pop_back();
     size_t pos = parent.find_last_of("/\\");
-    if (pos != std::string::npos)
-        parent = parent.substr(0, pos);
-    else
-        parent = ".";
+    if (pos != std::string::npos) parent = parent.substr(0, pos);
+    else parent = ".";
     std::string zipName = "project_backup_" + makeTimestamp() + ".zip";
     std::string zipPath = parent + "\\" + zipName;
     std::string cmd = "powershell Compress-Archive -Path \"" + targetDir + "\" -DestinationPath \"" + zipPath + "\" -Force";
     int rc = std::system(cmd.c_str());
-    if (rc != 0) {
-        CLR_ERROR << "[zip] 压缩失败\n";
-        return false;
-    }
+    if (rc != 0) { CLR_ERROR << "[zip] 压缩失败\n"; return false; }
     CLR_SUCCESS << "[zip] Archive: " << zipPath << "\n";
     return true;
 }
 
-// ----------------------------- file writer -------------------------
+// ----------------------------- 文件写入 -------------------------
 static bool writeFiles(const std::vector<std::pair<std::string, std::string>>& files,
                        const std::string& outDir, bool force) {
     bool anyFailure = false;
@@ -438,184 +443,214 @@ static bool writeFiles(const std::vector<std::pair<std::string, std::string>>& f
             continue;
         }
         std::ofstream outFile(fpath, std::ios::binary | std::ios::trunc);
-        if (!outFile) {
-            CLR_ERROR << "写入文件出错: " << fpath << "\n";
-            anyFailure = true;
-            continue;
-        }
+        if (!outFile) { CLR_ERROR << "写入文件出错: " << fpath << "\n"; anyFailure = true; continue; }
         outFile.write(content.data(), content.size());
-        if (!outFile.good()) {
-            CLR_ERROR << "写入内容出错: " << fpath << "\n";
-            anyFailure = true;
-        } else {
-            CLR_SUCCESS << "  + " << fpath << " (" << fullPath(fpath) << ")\n";
-        }
+        if (!outFile.good()) { CLR_ERROR << "写入内容出错: " << fpath << "\n"; anyFailure = true; }
+        else { CLR_SUCCESS << "  + " << fpath << " (" << fullPath(fpath) << ")\n"; }
     }
     return !anyFailure;
 }
 
-// ----------------------------- process one batch -------------------
-static void processClipboard(const std::string& sourceText, const std::string& outDir,
-                             bool force, bool noBackup, bool interactive = true) {
-    auto fileList = parseClipboardText(sourceText);
-    if (fileList.empty()) {
-        CLR_ERROR << "未找到 ###FILE: 标记\n";
-        return;
-    }
-    CLR_INFO << fileList.size() << " 个文件被找到\n";
-
-    auto warnings = detectEmptyBodies(fileList);
-    CLR_INFO << "将要创建的文件:\n";
-    for (const auto& [path, _] : fileList)
-        CLR_INFO << "  - " << path << "\n";
-    if (!warnings.empty()) {
-        CLR_WARN << "\n疑似空实现:\n";
-        for (const auto& w : warnings)
-            CLR_WARN << "  " << w.file << ":" << w.line << " - " << w.description << "\n";
-    }
-
-    if (interactive) {
-        CLR_INPUT << "\n继续创建文件吗？[y/N] ";
-        std::string response;
-        std::getline(std::cin, response);
-        if (response != "y" && response != "Y") {
-            CLR_INFO << "已取消\n";
-            return;
-        }
-    }
-
-    CLR_INFO << "正在创建文件... (输出目录: " << outDir << ")\n";
-    if (!writeFiles(fileList, outDir, force)) {
-        CLR_ERROR << "部分文件写入失败\n";
-    }
-    if (!noBackup) {
-        gitBackup(outDir);
-        zipBackup(outDir);
-    }
-    CLR_SUCCESS << "批次处理完成\n";
+// ----------------------------- 指令处理（统一路径） --------------
+static bool askUser(const std::string& question) {
+    CLR_INPUT << question << " [y/N] ";
+    std::string ans;
+    std::getline(std::cin, ans);
+    return ans == "y" || ans == "Y";
 }
 
-// ----------------------------- runtime commands --------------------
-static bool handleCommand(const std::string& input, Config& cfg, bool& quit) {
-    if (input.empty() || input[0] != ':') return false; // not a command
-
-    std::istringstream iss(input);
-    std::string cmd;
-    iss >> cmd; // remove colon
-    cmd = cmd.substr(1); // strip leading ':'
-    std::string arg;
-    std::getline(iss, arg);
-    arg = trim(arg);
-
-    if (cmd == "help") {
-        CLR_INFO << "运行时命令:\n";
-        CLR_INFO << "  :help         显示此帮助\n";
-        CLR_INFO << "  :dir [path]   显示/改变工作目录\n";
-        CLR_INFO << "  :out <dir>    设置输出目录\n";
-        CLR_INFO << "  :force [on|off] 强制覆盖开关\n";
-        CLR_INFO << "  :debug [on|off] 调试模式开关\n";
-        CLR_INFO << "  :backup [on|off] 备份开关\n";
-        CLR_INFO << "  :auto         立即处理剪贴板（无确认）\n";
-        CLR_INFO << "  :quit         退出程序\n";
-    }
-    else if (cmd == "dir") {
-        if (arg.empty()) {
-            CLR_INFO << "当前目录: " << getCurrentDir() << "\n";
+static void handleReadDirectives(const std::vector<FileDirective>& directives, const std::string& baseDir, const Config& cfg) {
+    for (const auto& d : directives) {
+        if (d.type != FileDirective::READ_FILE) continue;
+        std::string nativePath = d.path;
+        std::replace(nativePath.begin(), nativePath.end(), '/', '\\');
+        std::string full = fullPath(baseDir + "\\" + nativePath);
+        if (!fileExists(full)) { CLR_WARN << "[READ] 文件不存在: " << full << "\n"; continue; }
+        if (cfg.fileReadMode == "path") {
+            writeClipboard(full);
+            CLR_INFO << "文件路径已复制到剪贴板，请发送给 AI: " << full << "\n";
         } else {
-            if (setCurrentDir(arg)) {
-                CLR_SUCCESS << "工作目录已切换到: " << getCurrentDir() << "\n";
-                cfg.startupDir = arg; // remember
-            } else {
-                CLR_ERROR << "无法切换到目录: " << arg << "\n";
-            }
+            std::ifstream in(full, std::ios::binary);
+            if (!in) { CLR_ERROR << "[READ] 无法打开文件: " << full << "\n"; continue; }
+            std::ostringstream oss; oss << in.rdbuf();
+            std::string content = oss.str();
+            writeClipboard(content);
+            CLR_INFO << "文件内容 (" << content.size() << " 字节) 已复制到剪贴板，请发送给 AI\n";
         }
     }
-    else if (cmd == "out") {
-        if (!arg.empty()) {
-            cfg.outDir = arg;
-            CLR_SUCCESS << "输出目录已设置为: " << cfg.outDir << "\n";
+}
+
+static void handleDeleteDirectives(const std::vector<FileDirective>& directives, const std::string& baseDir) {
+    bool anyDelete = false;
+    for (const auto& d : directives) if (d.type == FileDirective::DELETE_FILE) { anyDelete = true; break; }
+    if (!anyDelete) return;
+
+    CLR_WARN << "\n检测到文件删除指令。即将删除以下文件:\n";
+    for (const auto& d : directives) {
+        if (d.type == FileDirective::DELETE_FILE) {
+            std::string nativePath = d.path;
+            std::replace(nativePath.begin(), nativePath.end(), '/', '\\');
+            CLR_WARN << "  - " << fullPath(baseDir + "\\" + nativePath) << "\n";
+        }
+    }
+    if (!askUser("确认要删除以上文件吗？(第一次确认)")) { CLR_INFO << "取消删除操作。\n"; return; }
+    if (!askUser("请再次确认：真的要永久删除以上文件吗？(第二次确认)")) { CLR_INFO << "取消删除操作。\n"; return; }
+
+    for (const auto& d : directives) {
+        if (d.type != FileDirective::DELETE_FILE) continue;
+        std::string nativePath = d.path;
+        std::replace(nativePath.begin(), nativePath.end(), '/', '\\');
+        std::string full = fullPath(baseDir + "\\" + nativePath);
+        if (DeleteFileA(full.c_str())) { CLR_SUCCESS << "[DELETE] 已删除: " << full << "\n"; }
+        else { CLR_ERROR << "[DELETE] 删除失败: " << full << "\n"; }
+    }
+}
+
+static void processDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+    std::string baseDirAbs = fullPath(cfg.outDir);
+    int createCount = 0, readCount = 0, deleteCount = 0;
+    for (auto& d : directives) {
+        if (d.type == FileDirective::CREATE_FILE) createCount++;
+        else if (d.type == FileDirective::READ_FILE) readCount++;
+        else if (d.type == FileDirective::DELETE_FILE) deleteCount++;
+    }
+    if (createCount + readCount + deleteCount == 0) return;
+
+    CLR_INFO << "指令统计: 创建 " << createCount << " 个, 读取 " << readCount
+              << " 个, 删除 " << deleteCount << " 个文件\n";
+
+    if (deleteCount > 0) handleDeleteDirectives(directives, baseDirAbs);
+
+    std::vector<std::pair<std::string, std::string>> createFiles;
+    for (auto& d : directives)
+        if (d.type == FileDirective::CREATE_FILE) createFiles.emplace_back(d.path, d.content);
+
+    if (!createFiles.empty()) {
+        auto warnings = detectEmptyBodies(createFiles);
+        CLR_INFO << "将要创建的文件:\n";
+        for (auto& [path, _] : createFiles) CLR_INFO << "  - " << path << "\n";
+        if (!warnings.empty()) {
+            CLR_WARN << "\n疑似空实现:\n";
+            for (auto& w : warnings) CLR_WARN << "  " << w.file << ":" << w.line << " - " << w.description << "\n";
+        }
+        if (askUser("继续创建文件吗？")) {
+            CLR_INFO << "正在创建...\n";
+            if (!writeFiles(createFiles, cfg.outDir, cfg.force))
+                CLR_ERROR << "部分文件写入失败\n";
         } else {
-            CLR_WARN << "当前输出目录: " << cfg.outDir << "\n";
+            CLR_INFO << "已跳过文件创建\n";
         }
     }
-    else if (cmd == "force") {
-        if (arg == "on") cfg.force = true;
-        else if (arg == "off") cfg.force = false;
-        else cfg.force = !cfg.force; // toggle
-        CLR_SUCCESS << "强制覆盖: " << (cfg.force ? "开" : "关") << "\n";
-    }
-    else if (cmd == "debug") {
-        if (arg == "on") cfg.debug = true;
-        else if (arg == "off") cfg.debug = false;
-        else cfg.debug = !cfg.debug;
-        CLR_SUCCESS << "调试模式: " << (cfg.debug ? "开" : "关") << "\n";
-    }
-    else if (cmd == "backup") {
-        if (arg == "on") cfg.noBackup = false;
-        else if (arg == "off") cfg.noBackup = true;
-        else cfg.noBackup = !cfg.noBackup;
-        CLR_SUCCESS << "备份: " << (cfg.noBackup ? "关" : "开") << "\n";
-    }
-    else if (cmd == "auto") {
-        std::string text;
-        try {
-            text = readClipboard();
-            if (text.empty()) {
-                CLR_WARN << "剪贴板为空\n";
-                return true;
-            }
-        } catch (const std::exception& e) {
-            CLR_ERROR << "读取剪贴板失败: " << e.what() << "\n";
-            return true;
+
+    if (readCount > 0) handleReadDirectives(directives, baseDirAbs, cfg);
+}
+
+// ----------------------------- 提示词链模式 ------------------------
+static const std::string DEFAULT_PROMPT_TEMPLATE = R"(你是一个严格的代码生成助手。请根据以下需求，生成对应的项目文件。
+【重要】输出必须且仅包含以下格式的内容，不能有任何额外解释、对话或 Markdown 说明：
+
+###FILE: 相对路径/文件名
+文件完整内容（代码、文本等）
+
+###FILE: 另一个相对路径/文件名
+该文件的完整内容
+
+... （可以继续添加更多文件）
+
+规则：
+- 路径使用正斜杠 `/`，相对于项目根目录。
+- 文件内容原样输出，不要额外的缩进或包裹字符。
+- 如果文件内容本身需要包含三个反引号，请避免破坏格式（或者使用其他方法转义）。
+- 确保你的回复中除了 `###FILE:` 标记和文件内容外，没有任何其他文字。
+
+当前需求：
+)";
+
+static void promptChainMode(Config& cfg) {
+    std::vector<std::string> requirements;
+    CLR_INFO << "=== 提示词链模式 ===\n";
+    CLR_INFO << "默认提示词模板:\n" << DEFAULT_PROMPT_TEMPLATE << "\n";
+    CLR_INFO << "请输入你的第一条需求，或输入 :help 查看命令\n";
+
+    while (true) {
+        CLR_INPUT << "需求> ";
+        std::string input;
+        std::getline(std::cin, input);
+        input = trim(input);
+        if (input.empty()) continue;
+        if (input[0] == ':') {
+            std::string cmd = input.substr(1);
+            if (cmd == "help") {
+                CLR_INFO << "命令: :help :history :undo :reset :generate :quit/:exit\n";
+            } else if (cmd == "history") {
+                if (requirements.empty()) CLR_INFO << "暂无需求\n";
+                else for (size_t i = 0; i < requirements.size(); ++i) CLR_INFO << "  " << i+1 << ". " << requirements[i] << "\n";
+            } else if (cmd == "undo") {
+                if (requirements.empty()) CLR_WARN << "没有可撤销的需求\n";
+                else { requirements.pop_back(); CLR_SUCCESS << "已撤销最后一条需求\n"; }
+            } else if (cmd == "reset") {
+                requirements.clear(); CLR_SUCCESS << "需求已清空\n";
+            } else if (cmd == "generate") {
+                std::ostringstream prompt;
+                prompt << DEFAULT_PROMPT_TEMPLATE;
+                for (auto& req : requirements) prompt << req << "\n";
+                writeClipboard(prompt.str());
+            } else if (cmd == "quit" || cmd == "exit") {
+                CLR_INFO << "退出提示词模式\n"; break;
+            } else CLR_WARN << "未知命令: " << cmd << "\n";
+        } else {
+            requirements.push_back(input);
+            CLR_SUCCESS << "已添加需求 (" << requirements.size() << "): " << input << "\n";
         }
-        processClipboard(text, cfg.outDir, cfg.force, cfg.noBackup, false);
-    }
-    else if (cmd == "quit") {
-        quit = true;
-    }
-    else {
-        CLR_WARN << "未知命令，输入 :help 查看帮助\n";
-    }
-    return true; // handled
-}
-
-// ----------------------------- window management --------------------
-static void applyWindowSettings(const Config& cfg) {
-    HWND hwnd = GetConsoleWindow();
-    if (hwnd == nullptr) return;
-    if (cfg.winLeft >= 0 && cfg.winTop >= 0 && cfg.winWidth > 0 && cfg.winHeight > 0) {
-        SetWindowPos(hwnd, nullptr, cfg.winLeft, cfg.winTop, cfg.winWidth, cfg.winHeight, SWP_NOZORDER | SWP_NOACTIVATE);
-        CLR_INFO << "窗口位置已恢复: " << cfg.winLeft << "," << cfg.winTop << " " << cfg.winWidth << "x" << cfg.winHeight << "\n";
     }
 }
 
-static void saveWindowSettings(Config& cfg) {
-    HWND hwnd = GetConsoleWindow();
-    if (hwnd == nullptr) return;
-    RECT rect;
-    if (GetWindowRect(hwnd, &rect)) {
-        cfg.winLeft = rect.left;
-        cfg.winTop = rect.top;
-        cfg.winWidth = rect.right - rect.left;
-        cfg.winHeight = rect.bottom - rect.top;
-    }
-}
-
-// ----------------------------- main --------------------------------
+// ----------------------------- 主命令处理 --------------------------
 static void printHelp() {
     CLR_INFO << "用法: ai-extract [选项]\n"
-              << "  -o <dir>       输出目录\n"
+              << "  -o <dir>       输出目录 (默认: . 即当前目录)\n"
               << "  -f             强制覆盖\n"
               << "  -i <file>      从文件读取\n"
               << "  --no-backup    跳过备份\n"
               << "  --debug        调试模式\n"
-              << "  --auto         强制自动模式\n"
-              << "  --loop         强制循环模式\n"
-              << "  -h, --help     帮助\n"
-              << "配置文件: ai-extract.ini\n"
-              << "运行时输入 :help 查看命令\n";
+              << "  --auto         自动模式\n"
+              << "  --loop         循环模式\n"
+              << "  -h, --help     帮助\n";
 }
 
+static void handleCommand(const std::string& input, Config& cfg, bool& quit, bool& promptMode, bool& autoProcess) {
+    if (input.empty() || input[0] != ':') return;
+    std::istringstream iss(input);
+    std::string cmd; iss >> cmd; cmd = cmd.substr(1);
+    std::string arg; std::getline(iss, arg); arg = trim(arg);
+
+    if (cmd == "help") {
+        CLR_INFO << "命令: :help :dir :out :force :debug :backup :auto :prompt :quit\n";
+    } else if (cmd == "dir") {
+        if (arg.empty()) CLR_INFO << "当前目录: " << getCurrentDir() << "\n";
+        else {
+            if (setCurrentDir(arg)) { CLR_SUCCESS << "工作目录已切换到: " << getCurrentDir() << "\n"; cfg.startupDir = arg; }
+            else CLR_ERROR << "无法切换到目录: " << arg << "\n";
+        }
+    } else if (cmd == "out") {
+        if (!arg.empty()) { cfg.outDir = arg; CLR_SUCCESS << "输出目录已设置为: " << fullPath(cfg.outDir) << "\n"; }
+        else CLR_WARN << "当前输出目录: " << fullPath(cfg.outDir) << "\n";
+    } else if (cmd == "force") {
+        if (arg == "on") cfg.force = true; else if (arg == "off") cfg.force = false; else cfg.force = !cfg.force;
+        CLR_SUCCESS << "强制覆盖: " << (cfg.force ? "开" : "关") << "\n";
+    } else if (cmd == "debug") {
+        if (arg == "on") cfg.debug = true; else if (arg == "off") cfg.debug = false; else cfg.debug = !cfg.debug;
+        CLR_SUCCESS << "调试模式: " << (cfg.debug ? "开" : "关") << "\n";
+    } else if (cmd == "backup") {
+        if (arg == "on") cfg.noBackup = false; else if (arg == "off") cfg.noBackup = true; else cfg.noBackup = !cfg.noBackup;
+        CLR_SUCCESS << "备份: " << (cfg.noBackup ? "关" : "开") << "\n";
+    } else if (cmd == "auto") autoProcess = true;
+    else if (cmd == "prompt") promptMode = true;
+    else if (cmd == "quit") quit = true;
+    else CLR_WARN << "未知命令: " << cmd << "\n";
+}
+
+// ----------------------------- main --------------------------------
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -624,21 +659,10 @@ int main(int argc, char* argv[]) {
     Config cfg;
     bool configLoaded = cfg.load(configPath);
 
-    // Apply window settings before any output
-    if (configLoaded) {
-        applyWindowSettings(cfg);
-    }
-
-    // Apply startup working directory
     if (configLoaded && !cfg.startupDir.empty()) {
-        if (setCurrentDir(cfg.startupDir)) {
-            CLR_INFO << "初始目录: " << getCurrentDir() << "\n";
-        } else {
-            CLR_WARN << "启动目录无效: " << cfg.startupDir << "\n";
-        }
+        if (setCurrentDir(cfg.startupDir)) CLR_INFO << "初始目录: " << getCurrentDir() << "\n";
     }
 
-    // Parse command-line overrides
     bool cmdForce = false, cmdNoBackup = false, cmdDebug = false, cmdAuto = false, cmdLoop = false;
     std::string cmdOutDir;
     std::string inputFile;
@@ -657,27 +681,21 @@ int main(int argc, char* argv[]) {
     }
 
     if (!cmdOutDir.empty()) cfg.outDir = cmdOutDir;
-    else if (cfg.outDir.empty()) cfg.outDir = "ai_project";
+    if (cfg.outDir.empty()) cfg.outDir = ".";
     if (cmdForce) cfg.force = true;
     if (cmdNoBackup) cfg.noBackup = true;
     if (cmdDebug) cfg.debug = true;
 
-    // If -i is given, process file and exit
     if (!inputFile.empty()) {
         std::ifstream in(inputFile.c_str());
-        if (!in) {
-            CLR_ERROR << "无法打开文件: " << inputFile << "\n";
-            return 1;
-        }
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        processClipboard(ss.str(), cfg.outDir, cfg.force, cfg.noBackup);
-        saveWindowSettings(cfg);
-        cfg.save(configPath, cfg.winLeft, cfg.winTop, cfg.winWidth, cfg.winHeight);
+        if (!in) { CLR_ERROR << "无法打开文件: " << inputFile << "\n"; return 1; }
+        std::ostringstream ss; ss << in.rdbuf();
+        auto directives = parseDirectives(ss.str());
+        processDirectives(directives, cfg);
+        cfg.save(configPath);
         return 0;
     }
 
-    // Mode selection
     std::string mode;
     if (cmdAuto) mode = "auto";
     else if (cmdLoop) mode = "loop";
@@ -685,58 +703,46 @@ int main(int argc, char* argv[]) {
     else mode = "interactive";
 
     if (mode == "auto") {
-        // Auto mode: read clipboard once, process without confirmation, then exit
         std::string text;
-        try {
-            text = readClipboard();
-            if (text.empty()) {
-                CLR_WARN << "剪贴板为空，自动模式无法继续\n";
-            } else {
-                processClipboard(text, cfg.outDir, cfg.force, cfg.noBackup, false);
-            }
-        } catch (...) {
-            CLR_ERROR << "读取剪贴板失败\n";
-        }
+        try { text = readClipboard(); } catch (...) { CLR_ERROR << "读取剪贴板失败\n"; }
+        if (!text.empty()) {
+            auto directives = parseDirectives(text);
+            processDirectives(directives, cfg);
+        } else CLR_WARN << "剪贴板为空\n";
     } else {
-        // Interactive / loop mode with command support
-        CLR_INFO << "=== AI-Extract (交互模式 - 输入 :help 查看命令) ===\n";
         bool quit = false;
         while (!quit) {
             CLR_INPUT << "\n按回车读取剪贴板，或输入命令 (:help) > ";
             std::string userInput;
             std::getline(std::cin, userInput);
+            userInput = trim(userInput);
 
-            // Check if it's a command
-            if (handleCommand(userInput, cfg, quit)) {
-                if (quit) break;
+            if (userInput.empty()) {
+                std::string text;
+                try { text = readClipboard(); } catch (const std::exception& e) { CLR_ERROR << "读取失败: " << e.what() << "\n"; continue; }
+                if (text.empty()) { CLR_WARN << "剪贴板为空\n"; continue; }
+                if (cfg.debug) CLR_INFO << "剪贴板内容:\n" << text << "\n";
+                auto directives = parseDirectives(text);
+                processDirectives(directives, cfg);
                 continue;
             }
 
-            // Empty line => proceed to read clipboard
-            std::string text;
-            try {
-                text = readClipboard();
-                if (text.empty()) {
-                    CLR_WARN << "剪贴板为空\n";
-                    continue;
+            bool promptMode = false, autoProcess = false;
+            handleCommand(userInput, cfg, quit, promptMode, autoProcess);
+
+            if (promptMode) promptChainMode(cfg);
+            if (autoProcess) {
+                std::string text;
+                try { text = readClipboard(); } catch (...) { CLR_ERROR << "读取失败\n"; }
+                if (!text.empty()) {
+                    auto directives = parseDirectives(text);
+                    processDirectives(directives, cfg);
                 }
-            } catch (const std::exception& e) {
-                CLR_ERROR << "读取失败: " << e.what() << "\n";
-                continue;
             }
-
-            if (cfg.debug) {
-                CLR_INFO << "剪贴板内容:\n" << text << "\n";
-            }
-
-            processClipboard(text, cfg.outDir, cfg.force, cfg.noBackup);
         }
     }
 
-    // Save config and window position on exit
-    saveWindowSettings(cfg);
-    cfg.save(configPath, cfg.winLeft, cfg.winTop, cfg.winWidth, cfg.winHeight);
-
+    cfg.save(configPath);
     CLR_INFO << "程序结束，按回车键退出...";
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     return 0;
