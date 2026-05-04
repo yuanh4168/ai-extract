@@ -1,9 +1,10 @@
 // ai-extract.cpp
-// 功能：AI代码提取、提示词链、文件读取/删除、备份等
-// 构建：g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32
+// 功能：AI代码提取、提示词链、文件读取/删除、备份、可视化目录树、打开文件夹等
+// 构建：g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32 -lshell32
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -21,6 +22,7 @@
 #include <array>
 #include <limits>
 #include <direct.h>
+#include <functional>
 
 // ----------------------------- 颜色助手 -----------------------------
 enum class Color {
@@ -56,13 +58,13 @@ public:
 // ----------------------------- 配置文件 -----------------------------
 struct Config {
     std::string fileName = "ai-extract.ini";
-    std::string defaultMode;   // "auto", "loop", "interactive"
-    std::string outDir;        // 输出目录（默认当前目录）
-    std::string startupDir;    // 启动后切换的工作目录
+    std::string defaultMode;
+    std::string outDir;
+    std::string startupDir;
     bool force = false;
     bool debug = false;
     bool noBackup = false;
-    std::string fileReadMode = "text"; // 读取文件时复制内容还是路径
+    std::string fileReadMode = "text";
 
     bool load(const std::string& path) {
         std::ifstream in(path);
@@ -125,20 +127,6 @@ static std::vector<std::string> splitLines(const std::string& text) {
     return lines;
 }
 
-static std::string escapeForDebug(const std::string& s) {
-    std::string result;
-    for (char c : s) {
-        if (c == '\n') result += "\\n";
-        else if (c == '\r') result += "\\r";
-        else if (c == '\t') result += "\\t";
-        else if (static_cast<unsigned char>(c) < 0x20)
-            result += "\\x" + std::to_string(static_cast<unsigned char>(c));
-        else
-            result += c;
-    }
-    return result;
-}
-
 // ----------------------------- 剪贴板 ---------------------------
 static std::string readClipboard() {
     if (!OpenClipboard(nullptr)) throw std::runtime_error("Cannot open clipboard");
@@ -149,7 +137,6 @@ static std::string readClipboard() {
     std::wstring wstr(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
-
     int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()), nullptr, 0, nullptr, nullptr);
     std::string utf8(sizeNeeded, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.size()), &utf8[0], sizeNeeded, nullptr, nullptr);
@@ -209,7 +196,40 @@ static std::string fullPath(const std::string& relative) {
     return relative;
 }
 
-// ----------------------------- 解析器 ------------------------------
+// ★★★ 新增：生成类似 tree 命令的可视化目录树 ★★★
+static std::string getDirectoryTree(const std::string& root) {
+    std::string result;
+    std::function<void(const std::string&, const std::string&)> recurse = [&](const std::string& dir, const std::string& prefix) {
+        std::string searchPath = dir + "\\*";
+        WIN32_FIND_DATAA ffd;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &ffd);
+        if (hFind == INVALID_HANDLE_VALUE) return;
+        std::vector<std::string> entries;
+        do {
+            if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
+            entries.push_back(ffd.cFileName);
+        } while (FindNextFileA(hFind, &ffd) != 0);
+        FindClose(hFind);
+        std::sort(entries.begin(), entries.end());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            bool last = (i == entries.size() - 1);
+            std::string entry = dir + "\\" + entries[i];
+            if (directoryExists(entry)) {
+                result += prefix + (last ? "└── " : "├── ") + entries[i] + "/\n";
+                recurse(entry, prefix + (last ? "    " : "│   "));
+            } else {
+                result += prefix + (last ? "└── " : "├── ") + entries[i] + "\n";
+            }
+        }
+    };
+    if (directoryExists(root)) {
+        result += root + "\n";
+        recurse(root, "");
+    }
+    return result;
+}
+
+// ----------------------------- 解析器（与原版相同） ------------------------------
 static std::vector<std::pair<std::string, std::string>> parseClipboardText(const std::string& text) {
     std::vector<std::pair<std::string, std::string>> files;
     std::regex splitter(R"(^###FILE:\s*([^\r\n]+))");
@@ -217,7 +237,6 @@ static std::vector<std::pair<std::string, std::string>> parseClipboardText(const
     std::string currentPath;
     std::ostringstream currentContent;
     bool insideFile = false;
-
     for (const auto& line : lines) {
         std::smatch match;
         std::string trimmedLine = trim(line);
@@ -261,7 +280,6 @@ static std::vector<std::pair<std::string, std::string>> parseClipboardText(const
     return files;
 }
 
-// ---- 解析 ###FILE / ###READ / ###DELETE 指令 ----
 struct FileDirective {
     enum Type { CREATE_FILE, READ_FILE, DELETE_FILE };
     Type type;
@@ -277,7 +295,6 @@ static std::vector<FileDirective> parseDirectives(const std::string& text) {
     std::string currentPath;
     std::ostringstream currentContent;
     bool insideBlock = false;
-
     for (const auto& line : lines) {
         std::smatch m;
         std::string trimmed = trim(line);
@@ -451,7 +468,7 @@ static bool writeFiles(const std::vector<std::pair<std::string, std::string>>& f
     return !anyFailure;
 }
 
-// ----------------------------- 指令处理（统一路径） --------------
+// ----------------------------- 指令处理 -------------------------
 static bool askUser(const std::string& question) {
     CLR_INPUT << question << " [y/N] ";
     std::string ans;
@@ -484,7 +501,6 @@ static void handleDeleteDirectives(const std::vector<FileDirective>& directives,
     bool anyDelete = false;
     for (const auto& d : directives) if (d.type == FileDirective::DELETE_FILE) { anyDelete = true; break; }
     if (!anyDelete) return;
-
     CLR_WARN << "\n检测到文件删除指令。即将删除以下文件:\n";
     for (const auto& d : directives) {
         if (d.type == FileDirective::DELETE_FILE) {
@@ -495,7 +511,6 @@ static void handleDeleteDirectives(const std::vector<FileDirective>& directives,
     }
     if (!askUser("确认要删除以上文件吗？(第一次确认)")) { CLR_INFO << "取消删除操作。\n"; return; }
     if (!askUser("请再次确认：真的要永久删除以上文件吗？(第二次确认)")) { CLR_INFO << "取消删除操作。\n"; return; }
-
     for (const auto& d : directives) {
         if (d.type != FileDirective::DELETE_FILE) continue;
         std::string nativePath = d.path;
@@ -515,16 +530,11 @@ static void processDirectives(const std::vector<FileDirective>& directives, cons
         else if (d.type == FileDirective::DELETE_FILE) deleteCount++;
     }
     if (createCount + readCount + deleteCount == 0) return;
-
-    CLR_INFO << "指令统计: 创建 " << createCount << " 个, 读取 " << readCount
-              << " 个, 删除 " << deleteCount << " 个文件\n";
-
+    CLR_INFO << "指令统计: 创建 " << createCount << " 个, 读取 " << readCount << " 个, 删除 " << deleteCount << " 个文件\n";
     if (deleteCount > 0) handleDeleteDirectives(directives, baseDirAbs);
-
     std::vector<std::pair<std::string, std::string>> createFiles;
     for (auto& d : directives)
         if (d.type == FileDirective::CREATE_FILE) createFiles.emplace_back(d.path, d.content);
-
     if (!createFiles.empty()) {
         auto warnings = detectEmptyBodies(createFiles);
         CLR_INFO << "将要创建的文件:\n";
@@ -541,11 +551,10 @@ static void processDirectives(const std::vector<FileDirective>& directives, cons
             CLR_INFO << "已跳过文件创建\n";
         }
     }
-
     if (readCount > 0) handleReadDirectives(directives, baseDirAbs, cfg);
 }
 
-// ----------------------------- 提示词链模式 ------------------------
+// ----------------------------- 提示词链模式（更新 :tree 行为） ------------------------
 static const std::string DEFAULT_PROMPT_TEMPLATE = R"(你是一个严格的代码生成助手，专门输出符合工具自动化处理的结构化代码。你的所有代码回复必须仅包含以下三种指令，除此之外不能有任何额外文字、解释、对话或 Markdown 格式化。
 
 [重要]给出的回复正文中不要包括任何markdown格式的代码框也就是三个`
@@ -594,7 +603,7 @@ static const std::string DEFAULT_PROMPT_TEMPLATE = R"(你是一个严格的代�
 
 ## 如果用户只是询问你程序的使用方法等不需要输出任何代码的内容那么你可以正常回答
 
-用户的需求有:
+当前需求：
 )";
 
 static void promptChainMode(Config& cfg) {
@@ -612,7 +621,7 @@ static void promptChainMode(Config& cfg) {
         if (input[0] == ':') {
             std::string cmd = input.substr(1);
             if (cmd == "help") {
-                CLR_INFO << "命令: :help :history :undo :reset :generate :quit/:exit\n";
+                CLR_INFO << "命令: :help :history :undo :reset :generate :tree :quit/:exit\n";
             } else if (cmd == "history") {
                 if (requirements.empty()) CLR_INFO << "暂无需求\n";
                 else for (size_t i = 0; i < requirements.size(); ++i) CLR_INFO << "  " << i+1 << ". " << requirements[i] << "\n";
@@ -625,7 +634,23 @@ static void promptChainMode(Config& cfg) {
                 std::ostringstream prompt;
                 prompt << DEFAULT_PROMPT_TEMPLATE;
                 for (auto& req : requirements) prompt << req << "\n";
+                // 生成时再次附加最新文件结构（可选，亦可由用户自行用 :tree 添加）
+                std::string tree = getDirectoryTree(fullPath(cfg.outDir));
+                if (!tree.empty()) {
+                    prompt << "\n当前项目的文件结构如下（供参考）：\n" << tree;
+                }
                 writeClipboard(prompt.str());
+            } else if (cmd == "tree") {
+                // ★ 新增：将可视化目录树作为一条需求插入
+                std::string tree = getDirectoryTree(fullPath(cfg.outDir));
+                if (tree.empty()) {
+                    CLR_INFO << "输出目录为空或不存在。\n";
+                } else {
+                    CLR_INFO << "当前项目文件结构:\n" << tree;
+                    std::string treeEntry = "当前项目的文件结构（参考）：\n" + tree;
+                    requirements.push_back(treeEntry);
+                    CLR_SUCCESS << "已将项目结构添加为需求 (" << requirements.size() << ")\n";
+                }
             } else if (cmd == "quit" || cmd == "exit") {
                 CLR_INFO << "退出提示词模式\n"; break;
             } else CLR_WARN << "未知命令: " << cmd << "\n";
@@ -636,12 +661,12 @@ static void promptChainMode(Config& cfg) {
     }
 }
 
-// ----------------------------- 主命令处理 --------------------------
+// ----------------------------- 主界面命令处理 --------------------
 static void printHelp() {
     CLR_INFO << "用法: ai-extract [选项]\n"
-              << "  -o <dir>       输出目录 (默认: . 即当前目录)\n"
+              << "  -o <dir>       输出目录 (默认: .)\n"
               << "  -f             强制覆盖\n"
-              << "  -i <file>      从文件读取\n"
+              << "  -i <file>      从文本文件读取\n"
               << "  --no-backup    跳过备份\n"
               << "  --debug        调试模式\n"
               << "  --auto         自动模式\n"
@@ -656,7 +681,7 @@ static void handleCommand(const std::string& input, Config& cfg, bool& quit, boo
     std::string arg; std::getline(iss, arg); arg = trim(arg);
 
     if (cmd == "help") {
-        CLR_INFO << "命令: :help :dir :out :force :debug :backup :auto :prompt :quit\n";
+        CLR_INFO << "命令: :help :dir :out :force :debug :backup :auto :prompt :tree :open :quit\n";
     } else if (cmd == "dir") {
         if (arg.empty()) CLR_INFO << "当前目录: " << getCurrentDir() << "\n";
         else {
@@ -677,7 +702,18 @@ static void handleCommand(const std::string& input, Config& cfg, bool& quit, boo
         CLR_SUCCESS << "备份: " << (cfg.noBackup ? "关" : "开") << "\n";
     } else if (cmd == "auto") autoProcess = true;
     else if (cmd == "prompt") promptMode = true;
-    else if (cmd == "quit") quit = true;
+    else if (cmd == "tree") {
+        std::string tree = getDirectoryTree(fullPath(cfg.outDir));
+        if (tree.empty()) CLR_INFO << "输出目录为空或不存在。\n";
+        else {
+            CLR_INFO << "当前项目文件结构:\n" << tree;
+            writeClipboard(tree);
+        }
+    } else if (cmd == "open") {
+        std::string path = fullPath(cfg.outDir);
+        ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        CLR_SUCCESS << "已打开文件夹: " << path << "\n";
+    } else if (cmd == "quit") quit = true;
     else CLR_WARN << "未知命令: " << cmd << "\n";
 }
 
