@@ -1,1 +1,4 @@
-g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32
+@echo off
+if not exist output mkdir output
+g++ -std=c++17 -o output\ai-extract.exe src\ai-extract.cpp -luser32
+echo Build complete: output\ai-extract.exe
