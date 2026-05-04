@@ -1,5 +1,5 @@
 // ai-extract.cpp
-// 功能：AI代码提取、提示词链、文件读取/删除、备份、可视化目录树、打开文件夹等
+// 功能：AI代码提取、提示词链、文件读取/删除/执行、备份、目录树、打开文件夹等
 // 构建：g++ -std=c++17 -o ai-extract.exe ai-extract.cpp -luser32 -lshell32
 
 #define WIN32_LEAN_AND_MEAN
@@ -65,6 +65,7 @@ struct Config {
     bool debug = false;
     bool noBackup = false;
     std::string fileReadMode = "text";
+    bool confirmExec = false;
 
     bool load(const std::string& path) {
         std::ifstream in(path);
@@ -90,6 +91,7 @@ struct Config {
             else if (key == "debug") debug = (val == "1" || val == "true");
             else if (key == "no_backup") noBackup = (val == "1" || val == "true");
             else if (key == "file_read_mode") fileReadMode = val;
+            else if (key == "confirm_exec") confirmExec = (val == "1" || val == "true");
         }
         return true;
     }
@@ -105,6 +107,7 @@ struct Config {
         out << "debug=" << (debug ? "true" : "false") << "\n";
         out << "no_backup=" << (noBackup ? "true" : "false") << "\n";
         out << "file_read_mode=" << fileReadMode << "\n";
+        out << "confirm_exec=" << (confirmExec ? "true" : "false") << "\n";
     }
 };
 
@@ -196,7 +199,7 @@ static std::string fullPath(const std::string& relative) {
     return relative;
 }
 
-// ★★★ 新增：生成类似 tree 命令的可视化目录树 ★★★
+// 可视化目录树
 static std::string getDirectoryTree(const std::string& root) {
     std::string result;
     std::function<void(const std::string&, const std::string&)> recurse = [&](const std::string& dir, const std::string& prefix) {
@@ -229,7 +232,56 @@ static std::string getDirectoryTree(const std::string& root) {
     return result;
 }
 
-// ----------------------------- 解析器（与原版相同） ------------------------------
+// ----------------------------- 命令执行 -----------------------------
+static bool execCommand(const std::string& cmdline, std::string& output, int& exitCode) {
+    HANDLE hChildStdoutRd, hChildStdoutWr;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hChildStdoutRd, &hChildStdoutWr, &sa, 0)) {
+        output = "创建管道失败";
+        return false;
+    }
+    SetHandleInformation(hChildStdoutRd, HANDLE_FLAG_INHERIT, 0);
+
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdError = hChildStdoutWr;
+    si.hStdOutput = hChildStdoutWr;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+
+    std::string cmd = "cmd /c \"" + cmdline + " 2>&1\"";
+
+    if (!CreateProcessA(NULL, const_cast<char*>(cmd.c_str()), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hChildStdoutWr);
+        CloseHandle(hChildStdoutRd);
+        output = "创建进程失败";
+        return false;
+    }
+    CloseHandle(hChildStdoutWr);
+
+    char buf[256];
+    DWORD bytesRead;
+    output.clear();
+    while (ReadFile(hChildStdoutRd, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0) {
+        output.append(buf, bytesRead);
+    }
+    CloseHandle(hChildStdoutRd);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD dwExitCode;
+    GetExitCodeProcess(pi.hProcess, &dwExitCode);
+    exitCode = static_cast<int>(dwExitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
+// ----------------------------- 解析器 ------------------------------
 static std::vector<std::pair<std::string, std::string>> parseClipboardText(const std::string& text) {
     std::vector<std::pair<std::string, std::string>> files;
     std::regex splitter(R"(^###FILE:\s*([^\r\n]+))");
@@ -281,7 +333,7 @@ static std::vector<std::pair<std::string, std::string>> parseClipboardText(const
 }
 
 struct FileDirective {
-    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE };
+    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE, EXEC_COMMAND };
     Type type;
     std::string path;
     std::string content;
@@ -289,28 +341,36 @@ struct FileDirective {
 
 static std::vector<FileDirective> parseDirectives(const std::string& text) {
     std::vector<FileDirective> directives;
-    std::regex re(R"(^###(FILE|READ|DELETE):\s*([^\r\n]+))");
+    std::regex re(R"(^###(FILE|READ|DELETE|EXEC):\s*([^\r\n]*))");
     auto lines = splitLines(text);
     std::string currentType;
     std::string currentPath;
     std::ostringstream currentContent;
     bool insideBlock = false;
+
     for (const auto& line : lines) {
         std::smatch m;
         std::string trimmed = trim(line);
         if (std::regex_match(trimmed, m, re)) {
             if (insideBlock) {
                 std::string content = currentContent.str();
-                auto clines = splitLines(content);
-                if (!clines.empty() && trim(clines.front()).rfind("```", 0) == 0) clines.erase(clines.begin());
-                if (!clines.empty() && trim(clines.back()) == "```") clines.pop_back();
-                std::string cleaned;
-                for (size_t i = 0; i < clines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += clines[i]; }
+                if (currentType == "FILE" || currentType == "EXEC") {
+                    auto clines = splitLines(content);
+                    if (!clines.empty() && trim(clines.front()).rfind("```", 0) == 0) clines.erase(clines.begin());
+                    if (!clines.empty() && trim(clines.back()) == "```") clines.pop_back();
+                    std::string cleaned;
+                    for (size_t i = 0; i < clines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += clines[i]; }
+                    content = cleaned;
+                }
                 FileDirective::Type t = FileDirective::CREATE_FILE;
                 if (currentType == "FILE") t = FileDirective::CREATE_FILE;
                 else if (currentType == "READ") t = FileDirective::READ_FILE;
                 else if (currentType == "DELETE") t = FileDirective::DELETE_FILE;
-                directives.push_back({t, currentPath, cleaned});
+                else if (currentType == "EXEC") t = FileDirective::EXEC_COMMAND;
+                if (t == FileDirective::EXEC_COMMAND)
+                    directives.push_back({t, "", content});
+                else
+                    directives.push_back({t, currentPath, content});
             }
             currentType = m[1].str();
             currentPath = m[2].str();
@@ -323,16 +383,23 @@ static std::vector<FileDirective> parseDirectives(const std::string& text) {
     }
     if (insideBlock) {
         std::string content = currentContent.str();
-        auto clines = splitLines(content);
-        if (!clines.empty() && trim(clines.front()).rfind("```", 0) == 0) clines.erase(clines.begin());
-        if (!clines.empty() && trim(clines.back()) == "```") clines.pop_back();
-        std::string cleaned;
-        for (size_t i = 0; i < clines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += clines[i]; }
+        if (currentType == "FILE" || currentType == "EXEC") {
+            auto clines = splitLines(content);
+            if (!clines.empty() && trim(clines.front()).rfind("```", 0) == 0) clines.erase(clines.begin());
+            if (!clines.empty() && trim(clines.back()) == "```") clines.pop_back();
+            std::string cleaned;
+            for (size_t i = 0; i < clines.size(); ++i) { if (i > 0) cleaned += '\n'; cleaned += clines[i]; }
+            content = cleaned;
+        }
         FileDirective::Type t = FileDirective::CREATE_FILE;
         if (currentType == "FILE") t = FileDirective::CREATE_FILE;
         else if (currentType == "READ") t = FileDirective::READ_FILE;
         else if (currentType == "DELETE") t = FileDirective::DELETE_FILE;
-        directives.push_back({t, currentPath, cleaned});
+        else if (currentType == "EXEC") t = FileDirective::EXEC_COMMAND;
+        if (t == FileDirective::EXEC_COMMAND)
+            directives.push_back({t, "", content});
+        else
+            directives.push_back({t, currentPath, content});
     }
     return directives;
 }
@@ -521,20 +588,65 @@ static void handleDeleteDirectives(const std::vector<FileDirective>& directives,
     }
 }
 
+static void handleExecDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+    for (const auto& d : directives) {
+        if (d.type != FileDirective::EXEC_COMMAND) continue;
+        std::string cmd = trim(d.content);
+        if (cmd.empty()) continue;
+        if (cfg.confirmExec) {
+            CLR_INPUT << "即将执行命令: " << cmd << "\n是否继续? [y/N] ";
+            std::string ans;
+            std::getline(std::cin, ans);
+            if (ans != "y" && ans != "Y") {
+                CLR_INFO << "已跳过命令执行\n";
+                continue;
+            }
+        }
+        CLR_INFO << "[EXEC] 执行: " << cmd << "\n";
+        std::string output;
+        int exitCode = -1;
+        if (execCommand(cmd, output, exitCode)) {
+            if (exitCode == 0) {
+                CLR_SUCCESS << "[EXEC] 命令执行成功 (退出码 0)\n";
+                if (!output.empty()) {
+                    CLR_INFO << "输出:\n" << output;
+                }
+            } else {
+                CLR_ERROR << "[EXEC] 命令执行失败 (退出码 " << exitCode << ")\n";
+                if (!output.empty()) {
+                    CLR_ERROR << "输出/错误:\n" << output;
+                }
+            }
+            writeClipboard(output);
+        } else {
+            CLR_ERROR << "[EXEC] 无法执行命令\n";
+        }
+    }
+}
+
+// ★ 调整处理顺序：删除 → 创建 → 执行 → 读取
 static void processDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
     std::string baseDirAbs = fullPath(cfg.outDir);
-    int createCount = 0, readCount = 0, deleteCount = 0;
+    int createCount = 0, readCount = 0, deleteCount = 0, execCount = 0;
     for (auto& d : directives) {
         if (d.type == FileDirective::CREATE_FILE) createCount++;
         else if (d.type == FileDirective::READ_FILE) readCount++;
         else if (d.type == FileDirective::DELETE_FILE) deleteCount++;
+        else if (d.type == FileDirective::EXEC_COMMAND) execCount++;
     }
-    if (createCount + readCount + deleteCount == 0) return;
-    CLR_INFO << "指令统计: 创建 " << createCount << " 个, 读取 " << readCount << " 个, 删除 " << deleteCount << " 个文件\n";
+    if (createCount + readCount + deleteCount + execCount == 0) return;
+
+    CLR_INFO << "指令统计: 创建 " << createCount << " 个, 读取 " << readCount
+              << " 个, 删除 " << deleteCount << " 个, 执行 " << execCount << " 个命令\n";
+
+    // 1. 删除
     if (deleteCount > 0) handleDeleteDirectives(directives, baseDirAbs);
+
+    // 2. 创建文件
     std::vector<std::pair<std::string, std::string>> createFiles;
     for (auto& d : directives)
         if (d.type == FileDirective::CREATE_FILE) createFiles.emplace_back(d.path, d.content);
+
     if (!createFiles.empty()) {
         auto warnings = detectEmptyBodies(createFiles);
         CLR_INFO << "将要创建的文件:\n";
@@ -551,57 +663,89 @@ static void processDirectives(const std::vector<FileDirective>& directives, cons
             CLR_INFO << "已跳过文件创建\n";
         }
     }
+
+    // 3. 执行命令（此时文件已存在）
+    if (execCount > 0) handleExecDirectives(directives, cfg);
+
+    // 4. 读取文件（可选）
     if (readCount > 0) handleReadDirectives(directives, baseDirAbs, cfg);
 }
 
-// ----------------------------- 提示词链模式（更新 :tree 行为） ------------------------
-static const std::string DEFAULT_PROMPT_TEMPLATE = R"(你是一个严格的代码生成助手，专门输出符合工具自动化处理的结构化代码。你的所有代码回复必须仅包含以下三种指令，除此之外不能有任何额外文字、解释、对话或 Markdown 格式化。
+// ----------------------------- 提示词链模式 ------------------------
+static const std::string DEFAULT_PROMPT_TEMPLATE = R"(
+你是一个严格遵循输出格式的代码生成与文件操作助手。你只能输出两类内容：回答用户问题和输出代码，每一次回答的正文部分只能包含上面的这两类别的其中一个，回答用户问题正常的回答，给出代码的部分必须且只能使用下述四种指令来响应，不能添加任何解释、说明、问候或 Markdown 装饰。整个回复由指令序列构成，指令之间由空行分隔。
 
-[重要]给出的回复正文中不要包括任何markdown格式的代码框也就是三个`
+## 指令语法
 
-## 允许的指令
+### 1. 创建/更新文件
+```
+###FILE: 相对路径/文件名
+文件完整内容（可多行）
+```
 
-1. **创建/更新文件**  
-   ```
-   ###FILE: 相对路径/文件名
-   文件完整内容
-   ```
-   示例：
-   ```
-   ###FILE: src/main.cpp
-   #include <iostream>
-   int main() { std::cout << "Hello"; return 0; }
-   ```
+- 路径使用正斜杠 `/`，相对于项目根目录。
+- 路径不得包含 `..` 或以 `/` 开头（绝对路径），否则会被拒绝。
+- 文件内容原样保留，包括缩进和空行。如果内容中包含三反引号，直接书写即可，工具会自动处理。
 
-2. **读取文件**（当你需要查看已有文件内容时）  
-   ```
-   ###READ: 相对路径/文件名
-   ```
-   示例：
-   ```
-   ###READ: src/utils.h
-   ```
+### 2. 读取文件内容到剪贴板
+```
+###READ: 相对路径/文件名
+```
 
-3. **删除文件**（当需要移除不再使用的文件时）  
-   ```
-   ###DELETE: 相对路径/文件名
-   ```
-   示例：
-   ```
-   ###DELETE: old_deprecated.cpp
-   ```
+- 工具会将对应文件的内容（或路径，取决于配置）复制到剪贴板，方便用户传给 AI。
 
-## 必须遵守的规则
+### 3. 删除文件
+```
+###DELETE: 相对路径/文件名
+```
 
-- 路径使用正斜杠 `/`，且相对于项目根目录。  
-- 指令必须严格按上述格式，每一条指令从新行开始，指令之间可以有空行。  
-- 内容中如果包含三个反引号或其他可能破坏格式的字符，请用适当方式转义或直接原样包含（工具会自动剥离多余标记）。  
-- 整个回复中不能出现任何解释、提示、问候、补充说明或 Markdown 代码块包裹。  
-- 如果需求涉及多个文件，请依次写出所有 `###FILE:`、`###READ:` 或 `###DELETE:` 指令。  
+- 工具会要求用户两次确认后才执行删除。
 
----
+### 4. 执行命令行命令
+```
+###EXEC:
+命令行指令（可多行，但通常一行即可）
+```
 
-## 如果用户只是询问你程序的使用方法等不需要输出任何代码的内容那么你可以正常回答
+- 指令从 `###EXEC:` 后换行开始，直到下一个指令头或文件结束。
+- 常用于编译、运行代码。例如：
+
+```
+###EXEC:
+g++ -std=c++17 -o program src/main.cpp && ./program
+```
+
+- 工具会执行该命令，并将标准输出和标准错误合并后复制到剪贴板。退出码非零时会显示警告。
+
+## 格式约束
+
+- 每条指令必须以 `###FILE:`、`###READ:`、`###DELETE:` 或 `###EXEC:` 开头，且冒号后有一个空格（对于 FILE/READ/DELETE）或直接换行（对于 EXEC）。
+- 指令体结束后，下一个指令头或回复结束即为该指令的终止。
+- 如果你的回复中需要包含多个文件，请连续排列多个 `###FILE:` 指令。
+- **整个回复中不能出现任何自然语言文本、解释、问候、补充说明或 Markdown 代码块标记（如 ```）来包裹指令。**
+- 你可以建议用户将 `###EXEC` 放在 `###FILE` 之后，以确保文件已创建再执行。
+
+## 示例（正确的输出格式）
+
+```
+###FILE: src/main.cpp
+#include <iostream>
+int main() {
+    std::cout << "Hello";
+    return 0;
+}
+
+###FILE: README.md
+# My Project
+
+###EXEC:
+g++ -std=c++17 -o hello src/main.cpp && hello
+
+###READ: src/main.cpp
+```
+注意：以上示例中没有额外文字，这就是整个回复的全部内容。
+
+请严格遵循上述规则，根据用户需求生成对应的指令序列。
 
 当前需求：
 )";
@@ -634,14 +778,12 @@ static void promptChainMode(Config& cfg) {
                 std::ostringstream prompt;
                 prompt << DEFAULT_PROMPT_TEMPLATE;
                 for (auto& req : requirements) prompt << req << "\n";
-                // 生成时再次附加最新文件结构（可选，亦可由用户自行用 :tree 添加）
                 std::string tree = getDirectoryTree(fullPath(cfg.outDir));
                 if (!tree.empty()) {
                     prompt << "\n当前项目的文件结构如下（供参考）：\n" << tree;
                 }
                 writeClipboard(prompt.str());
             } else if (cmd == "tree") {
-                // ★ 新增：将可视化目录树作为一条需求插入
                 std::string tree = getDirectoryTree(fullPath(cfg.outDir));
                 if (tree.empty()) {
                     CLR_INFO << "输出目录为空或不存在。\n";
