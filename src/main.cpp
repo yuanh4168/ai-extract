@@ -1,3 +1,4 @@
+// src/main.cpp
 #include <windows.h>
 #include <iostream>
 #include <fstream>
@@ -5,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <limits>
+#include <direct.h>
 #include "config.h"
 #include "utils.h"
 #include "clipboard.h"
@@ -12,8 +14,10 @@
 #include "directiveproc.h"
 #include "promptchain.h"
 #include "pathutil.h"
+#include "markdown_render.h"
 
-static void printHelp() {
+// 命令行 -h/--help 的简洁参数说明
+static void printUsage() {
     CLR_INFO << "用法: ai-extract [选项]\n"
               << "  -o <dir>       输出目录\n"
               << "  -f             强制覆盖\n"
@@ -22,12 +26,20 @@ static void printHelp() {
               << "  --debug        调试模式\n"
               << "  --auto         自动模式\n"
               << "  --loop         循环模式\n"
-              << "  -h, --help     帮助\n";
+              << "  -h, --help     显示命令行帮助\n";
 }
 
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+
+    // 启用 ANSI 转义序列
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    if (GetConsoleMode(hOut, &dwMode)) {
+        dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        SetConsoleMode(hOut, dwMode);
+    }
 
     std::string configPath = "ai-extract.ini";
     Config cfg;
@@ -41,14 +53,14 @@ int main(int argc, char* argv[]) {
     std::string cmdOutDir, inputFile;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-o" && i+1 < argc) cmdOutDir = argv[++i];
+        if (arg == "-o" && i + 1 < argc) cmdOutDir = argv[++i];
         else if (arg == "-f") cmdForce = true;
         else if (arg == "--no-backup") cmdNoBackup = true;
         else if (arg == "--debug") cmdDebug = true;
         else if (arg == "--auto") cmdAuto = true;
         else if (arg == "--loop") cmdLoop = true;
-        else if (arg == "-i" && i+1 < argc) inputFile = argv[++i];
-        else if (arg == "-h" || arg == "--help") { printHelp(); return 0; }
+        else if (arg == "-i" && i + 1 < argc) inputFile = argv[++i];
+        else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
         else { CLR_ERROR << "未知选项: " << arg << "\n"; return 1; }
     }
 
@@ -108,10 +120,49 @@ int main(int argc, char* argv[]) {
             }
             if (userIn[0] == ':') {
                 std::istringstream iss(userIn);
-                std::string cmd; iss >> cmd; cmd = cmd.substr(1);
-                std::string arg; std::getline(iss, arg); arg = trim(arg);
+                std::string cmd; iss >> cmd;
+                cmd = cmd.substr(1);
+                std::string arg; std::getline(iss, arg);
+                arg = trim(arg);
+
                 if (cmd == "help") {
-                    CLR_INFO << "命令: :help :dir :out :force :debug :backup :auto :prompt :tree :open :quit\n";
+                    // 获取 exe 所在目录
+                    char exePath[MAX_PATH];
+                    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+                    std::string exeDir(exePath);
+                    size_t lastSlash = exeDir.find_last_of("\\/");
+                    if (lastSlash != std::string::npos)
+                        exeDir = exeDir.substr(0, lastSlash);
+
+                    std::string readmePath = exeDir + "\\README.md";
+                    bool plain = (arg == "--plain");
+
+                    CLR_INFO << "正在显示: " << readmePath << "\n";
+                    if (!fileExists(readmePath)) {
+                        CLR_WARN << "README.md 未找到: " << readmePath << "\n";
+                    } else {
+                        std::ifstream in(readmePath, std::ios::binary);
+                        if (!in) {
+                            CLR_ERROR << "无法打开文件: " << readmePath << "\n";
+                        } else {
+                            std::ostringstream oss;
+                            oss << in.rdbuf();
+                            std::string content = oss.str();
+                            if (content.empty()) {
+                                CLR_WARN << "文件内容为空。\n";
+                            } else {
+                                if (plain) {
+                                    std::cout << content << std::endl;
+                                } else {
+                                    std::cout << renderMarkdown(content) << std::endl;
+                                }
+                            }
+                            std::cout << "\n按回车键继续...";
+                            std::cin.clear();
+                            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                            std::cin.get();
+                        }
+                    }
                 } else if (cmd == "dir") {
                     if (arg.empty()) CLR_INFO << "当前目录: " << getCurrentDir() << "\n";
                     else {
@@ -160,7 +211,46 @@ int main(int argc, char* argv[]) {
                     std::string path = fullPath(cfg.outDir);
                     ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
                     CLR_SUCCESS << "已打开文件夹: " << path << "\n";
-                } else if (cmd == "quit") quit = true;
+                } else if (cmd == "readme") {
+                    std::string readmePath = "README.md";
+                    bool plain = false;
+                    if (!arg.empty()) {
+                        if (arg == "--plain") plain = true;
+                        else readmePath = arg;
+                    }
+                    std::string absReadme = fullPath(readmePath);
+                    CLR_INFO << "正在读取: " << absReadme << "\n";
+                    if (!fileExists(absReadme)) {
+                        CLR_WARN << "文件不存在: " << absReadme << "\n";
+                    } else {
+                        std::ifstream in(absReadme, std::ios::binary);
+                        if (!in) {
+                            CLR_ERROR << "无法打开文件: " << absReadme << "\n";
+                        } else {
+                            std::ostringstream oss;
+                            oss << in.rdbuf();
+                            std::string content = oss.str();
+                            CLR_INFO << "文件大小: " << content.size() << " 字节\n";
+                            if (content.empty()) {
+                                CLR_WARN << "文件内容为空。\n";
+                            } else {
+                                if (plain) {
+                                    std::cout << content << std::endl;
+                                } else {
+                                    std::cout << renderMarkdown(content) << std::endl;
+                                }
+                            }
+                            std::cout << "\n按回车键继续...";
+                            std::cin.clear();
+                            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                            std::cin.get();
+                        }
+                    }
+                } else if (cmd == "quit") {
+                    quit = true;
+                } else {
+                    CLR_WARN << "未知命令: " << cmd << "\n";
+                }
             }
         }
     }
