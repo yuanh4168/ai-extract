@@ -15,8 +15,9 @@
 #include "promptchain.h"
 #include "pathutil.h"
 #include "markdown_render.h"
+#include "task_manager.h"
 
-// 命令行 -h/--help 的简洁参数说明
+// 命令行 -h/--help
 static void printUsage() {
     CLR_INFO << "用法: ai-extract [选项]\n"
               << "  -o <dir>       输出目录\n"
@@ -26,14 +27,93 @@ static void printUsage() {
               << "  --debug        调试模式\n"
               << "  --auto         自动模式\n"
               << "  --loop         循环模式\n"
-              << "  -h, --help     显示命令行帮助\n";
+              << "  -h, --help     显示命令行帮助\n"
+              << "  --task <cmd>   任务管理 (init / start <id> / stop / status)\n";
+}
+
+// 获取 exe 所在目录
+static std::string getExeDir() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string s(path);
+    size_t pos = s.find_last_of("\\/");
+    return (pos == std::string::npos) ? "." : s.substr(0, pos);
+}
+
+// 单次交互后处理任务状态
+static void handleTaskAfterProcessing(const std::string& clipboardText, Config& cfg) {
+    std::string workDir = fullPath(cfg.outDir);
+    std::string tasksPath = workDir + "\\.ai-extract\\tasks.json";
+    std::string activeCtxPath = workDir + "\\.ai-extract\\active_context.md";
+    std::string backupDir = workDir + "\\.ai-extract\\context_backups";
+
+    if (!fileExists(tasksPath)) return;
+    std::string activeTaskId;
+    auto tasks = loadTasks(tasksPath, activeTaskId);
+    if (activeTaskId.empty()) return;
+
+    auto it = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == activeTaskId; });
+    if (it == tasks.end()) return;
+
+    auto stateBlock = extractStateBlock(clipboardText);
+    if (!stateBlock) {
+        CLR_WARN << "[任务] 未在 AI 回复中找到有效的 STATE_BLOCK，请检查格式。\n";
+        return;
+    }
+
+    CLR_SUCCESS << "[任务] 解析 STATE_BLOCK: STEP " << stateBlock->step 
+                << " | 子任务: " << stateBlock->currentSubtask 
+                << " | NEXT: " << stateBlock->next << "\n";
+
+    // 更新 active_context.md
+    std::string oldCtx;
+    if (fileExists(activeCtxPath)) {
+        std::ifstream in(activeCtxPath);
+        std::ostringstream ss; ss << in.rdbuf();
+        oldCtx = ss.str();
+    }
+    std::string newCtx = oldCtx.empty() ? "" : applyStateBlock(oldCtx, *stateBlock);
+    if (!newCtx.empty()) {
+        std::ofstream out(activeCtxPath);
+        out << newCtx;
+    }
+
+    // 备份（每5轮）
+    static int lastBackupStep = 0;
+    if (stateBlock->step % 5 == 0 && stateBlock->step != lastBackupStep) {
+        backupActiveContext(activeCtxPath, backupDir);
+        lastBackupStep = stateBlock->step;
+        CLR_INFO << "[任务] 已自动备份 active_context.md\n";
+    }
+
+    // 追加到全局记忆
+    if (!stateBlock->facts.empty())
+        appendToGlobalMemory(stateBlock->facts);
+
+    // 状态流转
+    if (stateBlock->next == "TASK_COMPLETE" || stateBlock->next.empty()) {
+        it->status = "done";
+        activeTaskId = "";
+        CLR_SUCCESS << "[任务] 任务 " << it->id << " 已完成！\n";
+    } else if (stateBlock->next.find("ABANDON") != std::string::npos) {
+        it->status = "abandoned";
+        activeTaskId = "";
+        CLR_WARN << "[任务] 任务 " << it->id << " 已放弃。\n";
+    } else {
+        auto& subs = it->subtasks;
+        if (std::find(subs.begin(), subs.end(), stateBlock->next) == subs.end()) {
+            subs.push_back(stateBlock->next);
+            CLR_INFO << "[任务] AI 建议新增子任务: " << stateBlock->next << "\n";
+        }
+    }
+
+    saveTasks(tasksPath, tasks, activeTaskId);
 }
 
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    // 启用 ANSI 转义序列
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD dwMode = 0;
     if (GetConsoleMode(hOut, &dwMode)) {
@@ -50,7 +130,7 @@ int main(int argc, char* argv[]) {
     }
 
     bool cmdForce = false, cmdNoBackup = false, cmdDebug = false, cmdAuto = false, cmdLoop = false;
-    std::string cmdOutDir, inputFile;
+    std::string cmdOutDir, inputFile, taskCmd;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc) cmdOutDir = argv[++i];
@@ -61,6 +141,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--loop") cmdLoop = true;
         else if (arg == "-i" && i + 1 < argc) inputFile = argv[++i];
         else if (arg == "-h" || arg == "--help") { printUsage(); return 0; }
+        else if (arg == "--task" && i + 1 < argc) {
+            taskCmd = argv[++i];
+            while (i + 1 < argc && argv[i+1][0] != '-') {
+                taskCmd += " " + std::string(argv[++i]);
+            }
+        }
         else { CLR_ERROR << "未知选项: " << arg << "\n"; return 1; }
     }
 
@@ -70,6 +156,96 @@ int main(int argc, char* argv[]) {
     if (cmdNoBackup) cfg.noBackup = true;
     if (cmdDebug) cfg.debug = true;
 
+    // 处理 --task 命令行
+    if (!taskCmd.empty()) {
+        std::string workDir = fullPath(cfg.outDir);
+        std::string aiDir = workDir + "\\.ai-extract";
+        std::string tasksPath = aiDir + "\\tasks.json";
+        std::string activeCtxPath = aiDir + "\\active_context.md";
+        std::string pcPath = aiDir + "\\project_context.md";
+        std::string exeDir = getExeDir();
+
+        initProjectContext(workDir, exeDir);
+
+        std::istringstream iss(taskCmd);
+        std::string cmd, arg;
+        iss >> cmd >> arg;
+        if (cmd == "init") {
+            CLR_SUCCESS << "[任务] 项目记忆目录已初始化: " << aiDir << "\n";
+            return 0;
+        }
+        else if (cmd == "start" && !arg.empty()) {
+            std::string activeTaskId;
+            auto tasks = loadTasks(tasksPath, activeTaskId);
+            auto it = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == arg; });
+            if (it == tasks.end()) {
+                CLR_ERROR << "[任务] 任务 ID " << arg << " 不存在。\n";
+                return 1;
+            }
+            // 去除状态字符串的首尾空白后比较
+            std::string st = trim(it->status);
+            if (st == "done" || st == "abandoned") {
+                CLR_ERROR << "[任务] 任务 " << it->id << " 已完成或已放弃，无法再次启动。\n";
+                return 1;
+            }
+            if (!activeTaskId.empty()) {
+                CLR_ERROR << "[任务] 已有活动任务 " << activeTaskId << "，请先暂停或等待完成。\n";
+                return 1;
+            }
+            if (!it->depends_on.empty()) {
+                for (auto& dep : it->depends_on) {
+                    auto depIt = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == dep && t.status == "done"; });
+                    if (depIt == tasks.end()) {
+                        CLR_ERROR << "[任务] 依赖任务 " << dep << " 未完成，无法启动。\n";
+                        return 1;
+                    }
+                }
+            }
+            it->status = "in_progress";
+            activeTaskId = it->id;
+            saveTasks(tasksPath, tasks, activeTaskId);
+            std::string ctx = generateInitialActiveContext(*it);
+            std::ofstream out(activeCtxPath);
+            out << ctx;
+            std::ostringstream prompt;
+            if (fileExists(pcPath)) {
+                std::ifstream in(pcPath);
+                prompt << in.rdbuf() << "\n\n";
+            }
+            prompt << ctx;
+            writeClipboard(prompt.str());
+            CLR_SUCCESS << "[任务] 已启动任务 " << it->id << "，上下文已复制到剪贴板。\n";
+            return 0;
+        }
+        else if (cmd == "stop") {
+            std::string activeTaskId;
+            auto tasks = loadTasks(tasksPath, activeTaskId);
+            if (activeTaskId.empty()) {
+                CLR_WARN << "[任务] 当前没有活动任务。\n";
+                return 0;
+            }
+            auto it = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == activeTaskId; });
+            if (it != tasks.end()) it->status = "blocked";
+            activeTaskId = "";
+            saveTasks(tasksPath, tasks, activeTaskId);
+            CLR_SUCCESS << "[任务] 已暂停。\n";
+            return 0;
+        }
+        else if (cmd == "status") {
+            std::string activeTaskId;
+            auto tasks = loadTasks(tasksPath, activeTaskId);
+            CLR_INFO << "活动任务: " << (activeTaskId.empty() ? "无" : activeTaskId) << "\n";
+            for (auto& t : tasks)
+                CLR_INFO << "  [" << t.status << "] " << t.id << " " << t.title << "\n";
+            return 0;
+        }
+        else {
+            CLR_ERROR << "未知任务命令: " << cmd << "\n";
+            return 1;
+        }
+    }
+
+    // 文件输入模式
     if (!inputFile.empty()) {
         std::ifstream in(inputFile);
         if (!in) { CLR_ERROR << "无法打开文件: " << inputFile << "\n"; return 1; }
@@ -80,6 +256,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // 交互模式
     std::string mode;
     if (cmdAuto) mode = "auto";
     else if (cmdLoop) mode = "loop";
@@ -91,11 +268,12 @@ int main(int argc, char* argv[]) {
         try { text = readClipboard(); } catch (...) { CLR_ERROR << "读取剪贴板失败\n"; }
         if (text.empty()) { CLR_WARN << "剪贴板为空\n"; }
         else if (text.size() > cfg.maxClipboardSize) {
-            CLR_WARN << "剪贴板内容过大 (" << text.size() << " 字节)，超出限制 (" << cfg.maxClipboardSize << ")，已跳过。\n";
-            writeLog(LogLevel::WARN, "Auto mode: clipboard size exceeded limit");
+            CLR_WARN << "剪贴板内容过大，已跳过。\n";
+            writeLog(LogLevel::WARN, "Auto mode: clipboard too large");
         } else {
             auto dirs = parseDirectives(text);
             processDirectives(dirs, cfg);
+            handleTaskAfterProcessing(text, cfg);
         }
     } else {
         bool quit = false;
@@ -109,13 +287,14 @@ int main(int argc, char* argv[]) {
                 try { text = readClipboard(); } catch (const std::exception& e) { CLR_ERROR << "读取失败: " << e.what() << "\n"; continue; }
                 if (text.empty()) { CLR_WARN << "剪贴板为空\n"; continue; }
                 if (text.size() > cfg.maxClipboardSize) {
-                    CLR_WARN << "剪贴板内容过大 (" << text.size() << " 字节)，超出限制 (" << cfg.maxClipboardSize << ")，已跳过。\n";
+                    CLR_WARN << "剪贴板内容过大，已跳过。\n";
                     writeLog(LogLevel::WARN, "Clipboard too large, skipped.");
                     continue;
                 }
                 if (cfg.debug) CLR_INFO << "剪贴板内容:\n" << text << "\n";
                 auto dirs = parseDirectives(text);
                 processDirectives(dirs, cfg);
+                handleTaskAfterProcessing(text, cfg);
                 continue;
             }
             if (userIn[0] == ':') {
@@ -126,17 +305,13 @@ int main(int argc, char* argv[]) {
                 arg = trim(arg);
 
                 if (cmd == "help") {
-                    // 获取 exe 所在目录
                     char exePath[MAX_PATH];
                     GetModuleFileNameA(NULL, exePath, MAX_PATH);
                     std::string exeDir(exePath);
                     size_t lastSlash = exeDir.find_last_of("\\/");
-                    if (lastSlash != std::string::npos)
-                        exeDir = exeDir.substr(0, lastSlash);
-
+                    if (lastSlash != std::string::npos) exeDir = exeDir.substr(0, lastSlash);
                     std::string readmePath = exeDir + "\\README.md";
                     bool plain = (arg == "--plain");
-
                     CLR_INFO << "正在显示: " << readmePath << "\n";
                     if (!fileExists(readmePath)) {
                         CLR_WARN << "README.md 未找到: " << readmePath << "\n";
@@ -151,11 +326,8 @@ int main(int argc, char* argv[]) {
                             if (content.empty()) {
                                 CLR_WARN << "文件内容为空。\n";
                             } else {
-                                if (plain) {
-                                    std::cout << content << std::endl;
-                                } else {
-                                    std::cout << renderMarkdown(content) << std::endl;
-                                }
+                                if (plain) std::cout << content << std::endl;
+                                else std::cout << renderMarkdown(content) << std::endl;
                             }
                             std::cout << "\n按回车键继续...";
                             std::cin.clear();
@@ -163,55 +335,60 @@ int main(int argc, char* argv[]) {
                             std::cin.get();
                         }
                     }
-                } else if (cmd == "dir") {
+                }
+                else if (cmd == "dir") {
                     if (arg.empty()) CLR_INFO << "当前目录: " << getCurrentDir() << "\n";
                     else {
-                        if (setCurrentDir(arg)) {
-                            CLR_SUCCESS << "工作目录切换到: " << arg << "\n";
-                            cfg.startupDir = arg;
-                        } else CLR_ERROR << "无法切换\n";
+                        if (setCurrentDir(arg)) { CLR_SUCCESS << "工作目录切换到: " << arg << "\n"; cfg.startupDir = arg; }
+                        else CLR_ERROR << "无法切换\n";
                     }
-                } else if (cmd == "out") {
+                }
+                else if (cmd == "out") {
                     if (!arg.empty()) { cfg.outDir = arg; CLR_SUCCESS << "输出目录设置为: " << fullPath(arg) << "\n"; }
                     else CLR_WARN << "当前输出目录: " << fullPath(cfg.outDir) << "\n";
-                } else if (cmd == "force") {
+                }
+                else if (cmd == "force") {
                     if (arg == "on") cfg.force = true;
                     else if (arg == "off") cfg.force = false;
                     else cfg.force = !cfg.force;
                     CLR_SUCCESS << "强制覆盖: " << (cfg.force ? "开" : "关") << "\n";
-                } else if (cmd == "debug") {
+                }
+                else if (cmd == "debug") {
                     if (arg == "on") cfg.debug = true;
                     else if (arg == "off") cfg.debug = false;
                     else cfg.debug = !cfg.debug;
                     CLR_SUCCESS << "调试模式: " << (cfg.debug ? "开" : "关") << "\n";
-                } else if (cmd == "backup") {
+                }
+                else if (cmd == "backup") {
                     if (arg == "on") cfg.noBackup = false;
                     else if (arg == "off") cfg.noBackup = true;
                     else cfg.noBackup = !cfg.noBackup;
                     CLR_SUCCESS << "备份: " << (cfg.noBackup ? "关" : "开") << "\n";
-                } else if (cmd == "auto") {
+                }
+                else if (cmd == "auto") {
                     std::string text;
                     try { text = readClipboard(); } catch (...) { CLR_ERROR << "读取失败\n"; }
                     if (!text.empty()) {
-                        if (text.size() > cfg.maxClipboardSize) {
-                            CLR_WARN << "剪贴板内容过大，已跳过。\n";
-                            writeLog(LogLevel::WARN, "Clipboard too large during auto command");
-                        } else {
+                        if (text.size() > cfg.maxClipboardSize) { CLR_WARN << "剪贴板内容过大，已跳过。\n"; }
+                        else {
                             auto dirs = parseDirectives(text);
                             processDirectives(dirs, cfg);
+                            handleTaskAfterProcessing(text, cfg);
                         }
                     }
-                } else if (cmd == "prompt") {
-                    promptChainMode(cfg);
-                } else if (cmd == "tree") {
+                }
+                else if (cmd == "prompt") { promptChainMode(cfg); }
+                else if (cmd == "tree") {
                     std::string tree = getDirectoryTree(fullPath(cfg.outDir));
                     if (tree.empty()) CLR_INFO << "输出目录为空\n";
                     else { CLR_INFO << tree; writeClipboard(tree); }
-                } else if (cmd == "open") {
+                }
+                else if (cmd == "open") {
                     std::string path = fullPath(cfg.outDir);
                     ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
                     CLR_SUCCESS << "已打开文件夹: " << path << "\n";
-                } else if (cmd == "readme") {
+                }
+                else if (cmd == "readme") {
                     std::string readmePath = "README.md";
                     bool plain = false;
                     if (!arg.empty()) {
@@ -220,25 +397,19 @@ int main(int argc, char* argv[]) {
                     }
                     std::string absReadme = fullPath(readmePath);
                     CLR_INFO << "正在读取: " << absReadme << "\n";
-                    if (!fileExists(absReadme)) {
-                        CLR_WARN << "文件不存在: " << absReadme << "\n";
-                    } else {
+                    if (!fileExists(absReadme)) { CLR_WARN << "文件不存在: " << absReadme << "\n"; }
+                    else {
                         std::ifstream in(absReadme, std::ios::binary);
-                        if (!in) {
-                            CLR_ERROR << "无法打开文件: " << absReadme << "\n";
-                        } else {
+                        if (!in) CLR_ERROR << "无法打开文件: " << absReadme << "\n";
+                        else {
                             std::ostringstream oss;
                             oss << in.rdbuf();
                             std::string content = oss.str();
                             CLR_INFO << "文件大小: " << content.size() << " 字节\n";
-                            if (content.empty()) {
-                                CLR_WARN << "文件内容为空。\n";
-                            } else {
-                                if (plain) {
-                                    std::cout << content << std::endl;
-                                } else {
-                                    std::cout << renderMarkdown(content) << std::endl;
-                                }
+                            if (content.empty()) CLR_WARN << "文件内容为空。\n";
+                            else {
+                                if (plain) std::cout << content << std::endl;
+                                else std::cout << renderMarkdown(content) << std::endl;
                             }
                             std::cout << "\n按回车键继续...";
                             std::cin.clear();
@@ -246,11 +417,90 @@ int main(int argc, char* argv[]) {
                             std::cin.get();
                         }
                     }
-                } else if (cmd == "quit") {
-                    quit = true;
-                } else {
-                    CLR_WARN << "未知命令: " << cmd << "\n";
                 }
+                else if (cmd == "quit") { quit = true; }
+                // 交互式任务命令
+                else if (cmd == "task") {
+                    std::string workDir = fullPath(cfg.outDir);
+                    std::string aiDir = workDir + "\\.ai-extract";
+                    std::string tasksPath = aiDir + "\\tasks.json";
+                    std::string activeCtxPath = aiDir + "\\active_context.md";
+                    std::string pcPath = aiDir + "\\project_context.md";
+                    std::string exeDir = getExeDir();
+                    initProjectContext(workDir, exeDir);
+
+                    std::istringstream iss(arg);
+                    std::string act, taskId;
+                    iss >> act >> taskId;
+                    if (act == "init") {
+                        CLR_SUCCESS << "[任务] 项目记忆目录已初始化。\n";
+                    }
+                    else if (act == "start" && !taskId.empty()) {
+                        std::string activeTaskId;
+                        auto tasks = loadTasks(tasksPath, activeTaskId);
+                        auto it = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == taskId; });
+                        if (it == tasks.end()) {
+                            CLR_ERROR << "[任务] 任务 ID 不存在。\n";
+                        } else {
+                            std::string st = trim(it->status);
+                            if (st == "done" || st == "abandoned") {
+                                CLR_ERROR << "[任务] 任务 " << it->id << " 已完成或已放弃，无法再次启动。\n";
+                            } else if (!activeTaskId.empty()) {
+                                CLR_ERROR << "[任务] 已有活动任务 " << activeTaskId << "，请先暂停或等待完成。\n";
+                            } else {
+                                if (!it->depends_on.empty()) {
+                                    bool depsMet = true;
+                                    for (auto& dep : it->depends_on) {
+                                        auto depIt = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == dep && t.status == "done"; });
+                                        if (depIt == tasks.end()) { depsMet = false; break; }
+                                    }
+                                    if (!depsMet) {
+                                        CLR_ERROR << "[任务] 依赖任务未完成，无法启动。\n";
+                                        continue;
+                                    }
+                                }
+                                it->status = "in_progress";
+                                activeTaskId = it->id;
+                                saveTasks(tasksPath, tasks, activeTaskId);
+                                std::string ctx = generateInitialActiveContext(*it);
+                                std::ofstream out(activeCtxPath);
+                                out << ctx;
+                                std::ostringstream prompt;
+                                if (fileExists(pcPath)) {
+                                    std::ifstream in(pcPath);
+                                    prompt << in.rdbuf() << "\n\n";
+                                }
+                                prompt << ctx;
+                                writeClipboard(prompt.str());
+                                CLR_SUCCESS << "[任务] 已启动，上下文已复制到剪贴板。\n";
+                            }
+                        }
+                    }
+                    else if (act == "stop") {
+                        std::string activeTaskId;
+                        auto tasks = loadTasks(tasksPath, activeTaskId);
+                        if (activeTaskId.empty()) {
+                            CLR_WARN << "[任务] 当前没有活动任务。\n";
+                        } else {
+                            auto it = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) { return t.id == activeTaskId; });
+                            if (it != tasks.end()) it->status = "blocked";
+                            activeTaskId = "";
+                            saveTasks(tasksPath, tasks, activeTaskId);
+                            CLR_SUCCESS << "[任务] 已暂停。\n";
+                        }
+                    }
+                    else if (act == "status") {
+                        std::string activeTaskId;
+                        auto tasks = loadTasks(tasksPath, activeTaskId);
+                        CLR_INFO << "活动任务: " << (activeTaskId.empty() ? "无" : activeTaskId) << "\n";
+                        for (auto& t : tasks)
+                            CLR_INFO << "  [" << t.status << "] " << t.id << " " << t.title << "\n";
+                    }
+                    else {
+                        CLR_WARN << "用法: :task init|start <id>|stop|status\n";
+                    }
+                }
+                else { CLR_WARN << "未知命令: " << cmd << "\n"; }
             }
         }
     }
