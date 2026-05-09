@@ -51,7 +51,8 @@ static bool execCommand(const std::string& userCmd, std::string& output, int& ex
     return true;
 }
 
-static void handleReadDirectives(const std::vector<FileDirective>& directives, const std::string& baseDirAbs, const Config& cfg) {
+// 所有输出文本的累积缓冲区（引用传递）
+static void handleReadDirectives(const std::vector<FileDirective>& directives, const std::string& baseDirAbs, const Config& cfg, std::string& outputBuf) {
     for (const auto& d : directives) {
         if (d.type != FileDirective::READ_FILE) continue;
         std::string safeAbsPath;
@@ -69,28 +70,29 @@ static void handleReadDirectives(const std::vector<FileDirective>& directives, c
         size_t fileSize = fileSizeCheck.tellg();
         fileSizeCheck.close();
         if (cfg.fileReadMode == "text" && fileSize > cfg.maxReadSize) {
-            CLR_WARN << "[READ] 文件过大 (" << fileSize << " 字节)，超出限制 (" << cfg.maxReadSize << ")，自动切换为仅复制路径。\n";
+            CLR_WARN << "[READ] 文件过大 (" << fileSize << " 字节)，自动切换为仅复制路径。\n";
+            outputBuf += safeAbsPath + "\n";
             writeLog(LogLevel::WARN, "[READ] Large file fallback to path: " + safeAbsPath);
-            writeClipboard(safeAbsPath);
             continue;
         }
         if (cfg.fileReadMode == "path") {
-            writeClipboard(safeAbsPath);
-            CLR_INFO << "文件路径已复制到剪贴板: " << safeAbsPath << "\n";
+            outputBuf += safeAbsPath + "\n";
+            CLR_INFO << "文件路径已加入输出: " << safeAbsPath << "\n";
         } else {
             std::ifstream in(safeAbsPath, std::ios::binary);
             if (!in) { CLR_ERROR << "[READ] 无法打开文件: " << safeAbsPath << "\n"; continue; }
             std::ostringstream oss;
             oss << in.rdbuf();
             std::string content = oss.str();
-            writeClipboard(content);
-            CLR_INFO << "文件内容 (" << content.size() << " 字节) 已复制到剪贴板\n";
+            outputBuf += content;
+            CLR_INFO << "文件内容 (" << content.size() << " 字节) 已加入输出\n";
         }
         writeLog(LogLevel::INFO, "[READ] Processed file: " + safeAbsPath);
     }
 }
 
 static void handleDeleteDirectives(const std::vector<FileDirective>& directives, const std::string& baseDirAbs, const Config&) {
+    // 删除操作不产生输出文本，保留原样
     std::vector<std::string> safePaths;
     for (const auto& d : directives) {
         if (d.type != FileDirective::DELETE_FILE) continue;
@@ -117,7 +119,7 @@ static void handleDeleteDirectives(const std::vector<FileDirective>& directives,
     }
 }
 
-static void handleExecDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+static void handleExecDirectives(const std::vector<FileDirective>& directives, const Config& cfg, std::string& outputBuf) {
     for (const auto& d : directives) {
         if (d.type != FileDirective::EXEC_COMMAND) continue;
         std::string cmd = trim(d.content);
@@ -138,7 +140,7 @@ static void handleExecDirectives(const std::vector<FileDirective>& directives, c
                 CLR_ERROR << "[EXEC] 失败 (退出码 " << exitCode << ")\n";
                 if (!output.empty()) CLR_ERROR << output;
             }
-            writeClipboard(output);
+            outputBuf += output + "\n";  // 将命令输出追加到缓冲区
             writeLog(exitCode == 0 ? LogLevel::SUCCESS : LogLevel::ERROR, "[EXEC] " + cmd);
         } else {
             CLR_ERROR << "[EXEC] 无法执行命令\n";
@@ -147,8 +149,7 @@ static void handleExecDirectives(const std::vector<FileDirective>& directives, c
     }
 }
 
-// ★ 修改点：对空 URL 增加明确警告
-static void handleBrowseDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+static void handleBrowseDirectives(const std::vector<FileDirective>& directives, const Config& cfg, std::string& outputBuf) {
     std::string combined;
     bool first = true;
     for (const auto& d : directives) {
@@ -173,12 +174,12 @@ static void handleBrowseDirectives(const std::vector<FileDirective>& directives,
         }
     }
     if (!combined.empty()) {
-        writeClipboard(combined);
-        CLR_SUCCESS << "[BROWSE] 内容已复制到剪贴板\n";
+        outputBuf += combined + "\n";  // 浏览结果追加到缓冲区
     }
 }
 
-void processDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+std::string processDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+    std::string outputBuffer;  // 最终将返回此缓冲区
     std::string baseDirAbs = fullPath(cfg.outDir);
     int cCreate = 0, cRead = 0, cDelete = 0, cExec = 0, cBrowse = 0;
     for (auto& d : directives) {
@@ -188,12 +189,12 @@ void processDirectives(const std::vector<FileDirective>& directives, const Confi
         else if (d.type == FileDirective::EXEC_COMMAND) cExec++;
         else if (d.type == FileDirective::BROWSE_PAGE) cBrowse++;
     }
-    if (cCreate + cRead + cDelete + cExec + cBrowse == 0) return;
+    if (cCreate + cRead + cDelete + cExec + cBrowse == 0) return outputBuffer;
     CLR_INFO << "指令统计: 创建 " << cCreate << " 个, 读取 " << cRead << " 个, 删除 " << cDelete 
              << " 个, 执行 " << cExec << " 个, 浏览 " << cBrowse << " 个\n";
 
     if (cDelete > 0) handleDeleteDirectives(directives, baseDirAbs, cfg);
-    if (cBrowse > 0) handleBrowseDirectives(directives, cfg);
+    if (cBrowse > 0) handleBrowseDirectives(directives, cfg, outputBuffer);
 
     std::vector<std::pair<std::string, std::string>> createFiles;
     for (auto& d : directives) {
@@ -250,6 +251,8 @@ void processDirectives(const std::vector<FileDirective>& directives, const Confi
         }
     }
 
-    if (cExec > 0) handleExecDirectives(directives, cfg);
-    if (cRead > 0) handleReadDirectives(directives, baseDirAbs, cfg);
+    if (cExec > 0) handleExecDirectives(directives, cfg, outputBuffer);
+    if (cRead > 0) handleReadDirectives(directives, baseDirAbs, cfg, outputBuffer);
+
+    return outputBuffer;
 }

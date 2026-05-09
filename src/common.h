@@ -31,7 +31,7 @@ enum class Color { WHITE=7, GREEN=10, YELLOW=14, RED=12, CYAN=11, MAGENTA=13 };
 enum class LogLevel { INFO, WARN, ERROR, SUCCESS };
 
 struct FileDirective {
-    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE, EXEC_COMMAND, BROWSE_PAGE };  // 新增 BROWSE_PAGE
+    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE, EXEC_COMMAND, BROWSE_PAGE, STATE_BLOCK };  // 新增 STATE_BLOCK
     Type type;
     std::string path;
     std::string content;

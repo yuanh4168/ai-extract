@@ -105,6 +105,22 @@ static void handleTaskAfterProcessing(const std::string& clipboardText, Config& 
     saveTasks(tasksPath, tasks, activeTaskId);
 }
 
+// 新增：生成下一轮对话的上下文（合并 project_context.md 和 active_context.md）
+static std::string generateNextContext(const Config& cfg) {
+    std::string pcPath = fullPath(cfg.outDir) + "\\.ai-extract\\project_context.md";
+    std::string activeCtxPath = fullPath(cfg.outDir) + "\\.ai-extract\\active_context.md";
+    std::ostringstream combined;
+    if (fileExists(pcPath)) {
+        std::ifstream in(pcPath);
+        combined << in.rdbuf() << "\n\n";
+    }
+    if (fileExists(activeCtxPath)) {
+        std::ifstream in(activeCtxPath);
+        combined << in.rdbuf();
+    }
+    return combined.str();
+}
+
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -243,7 +259,9 @@ int main(int argc, char* argv[]) {
         if (!in) { CLR_ERROR << "无法打开文件: " << inputFile << "\n"; return 1; }
         std::ostringstream ss; ss << in.rdbuf();
         auto dirs = parseDirectives(ss.str());
-        processDirectives(dirs, cfg);
+        std::string outputAccum = processDirectives(dirs, cfg);
+        // 文件输入模式没有任务上下文，只输出执行结果
+        writeClipboard(outputAccum);
         cfg.save(configPath);
         return 0;
     }
@@ -265,8 +283,15 @@ int main(int argc, char* argv[]) {
         }
         else {
             auto dirs = parseDirectives(text);
-            processDirectives(dirs, cfg);
+            std::string outputAccum = processDirectives(dirs, cfg);
             handleTaskAfterProcessing(text, cfg);
+            // 统一缓冲区：合并任务上下文
+            std::string ctx = generateNextContext(cfg);
+            if (!ctx.empty()) {
+                if (!outputAccum.empty()) outputAccum += "\n---\n";
+                outputAccum += ctx;
+            }
+            writeClipboard(outputAccum);
         }
     } else {
         bool quit = false;
@@ -288,8 +313,15 @@ int main(int argc, char* argv[]) {
                 }
                 if (cfg.debug) CLR_INFO << "剪贴板内容:\n" << text << "\n";
                 auto dirs = parseDirectives(text);
-                processDirectives(dirs, cfg);
+                std::string outputAccum = processDirectives(dirs, cfg);
                 handleTaskAfterProcessing(text, cfg);
+                // 统一缓冲区：合并任务上下文
+                std::string ctx = generateNextContext(cfg);
+                if (!ctx.empty()) {
+                    if (!outputAccum.empty()) outputAccum += "\n---\n";
+                    outputAccum += ctx;
+                }
+                writeClipboard(outputAccum);
                 continue;
             }
             if (userIn[0] == ':') {
@@ -366,8 +398,14 @@ int main(int argc, char* argv[]) {
                         if (text.size() > cfg.maxClipboardSize) { CLR_WARN << "剪贴板内容过大，已跳过。\n"; }
                         else {
                             auto dirs = parseDirectives(text);
-                            processDirectives(dirs, cfg);
+                            std::string outputAccum = processDirectives(dirs, cfg);
                             handleTaskAfterProcessing(text, cfg);
+                            std::string ctx = generateNextContext(cfg);
+                            if (!ctx.empty()) {
+                                if (!outputAccum.empty()) outputAccum += "\n---\n";
+                                outputAccum += ctx;
+                            }
+                            writeClipboard(outputAccum);
                         }
                     }
                 }
@@ -511,25 +549,11 @@ int main(int argc, char* argv[]) {
                 }
                 // 新增 :next 命令
                 else if (cmd == "next") {
-                    std::string workDir = fullPath(cfg.outDir);
-                    std::string pcPath = workDir + "\\.ai-extract\\project_context.md";
-                    std::string activeCtxPath = workDir + "\\.ai-extract\\active_context.md";
-
-                    std::ostringstream combined;
-                    if (fileExists(pcPath)) {
-                        std::ifstream in(pcPath);
-                        combined << in.rdbuf();
-                        combined << "\n\n";
-                    }
-                    if (fileExists(activeCtxPath)) {
-                        std::ifstream in(activeCtxPath);
-                        combined << in.rdbuf();
-                    }
-                    std::string result = combined.str();
-                    if (result.empty()) {
-                        CLR_WARN << "[next] 没有可用的项目上下文或活动上下文。\n";
+                    std::string ctx = generateNextContext(cfg);
+                    if (ctx.empty()) {
+                        CLR_WARN << "[next] 没有可用的上下文。\n";
                     } else {
-                        writeClipboard(result);
+                        writeClipboard(ctx);
                         CLR_SUCCESS << "[next] 已将下一轮对话上下文复制到剪贴板。\n";
                     }
                 }
