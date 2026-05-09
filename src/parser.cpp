@@ -4,7 +4,7 @@
 
 std::vector<FileDirective> parseDirectives(const std::string& text) {
     std::vector<FileDirective> directives;
-    std::regex re(R"(^###(FILE|READ|DELETE|EXEC):\s*([^\r\n]*))");
+    std::regex re(R"(^###(FILE|READ|DELETE|EXEC|BROWSE):\s*([^\r\n]*))");
     auto lines = splitLines(text);
     std::string currentType, currentPath;
     std::ostringstream currentContent;
@@ -14,6 +14,7 @@ std::vector<FileDirective> parseDirectives(const std::string& text) {
         std::smatch m;
         std::string trimmed = trim(line);
         if (std::regex_match(trimmed, m, re)) {
+            // 结束上一个块
             if (insideBlock) {
                 std::string content = currentContent.str();
                 if (currentType == "FILE" || currentType == "EXEC") {
@@ -37,16 +38,26 @@ std::vector<FileDirective> parseDirectives(const std::string& text) {
                 else
                     directives.push_back({t, currentPath, content});
             }
+
             currentType = m[1].str();
             currentPath = m[2].str();
             currentContent.str("");
             currentContent.clear();
-            insideBlock = true;
+
+            if (currentType == "BROWSE") {
+                // ★ 修正：BROWSE 的 path 应当是 URL（currentPath），content 为空
+                directives.push_back({FileDirective::BROWSE_PAGE, currentPath, ""});
+                insideBlock = false;
+            } else {
+                insideBlock = true;
+            }
         } else if (insideBlock) {
             if (currentContent.tellp() > 0) currentContent << '\n';
             currentContent << line;
         }
     }
+
+    // 处理最后一个未闭合的块
     if (insideBlock) {
         std::string content = currentContent.str();
         if (currentType == "FILE" || currentType == "EXEC") {
@@ -69,7 +80,9 @@ std::vector<FileDirective> parseDirectives(const std::string& text) {
             directives.push_back({t, "", content});
         else
             directives.push_back({t, currentPath, content});
+        // 注意：BROWSE 在循环内已经立即处理，不会走到这里的 insideBlock
     }
+
     return directives;
 }
 

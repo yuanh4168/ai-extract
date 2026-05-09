@@ -16,8 +16,9 @@
 #include "pathutil.h"
 #include "markdown_render.h"
 #include "task_manager.h"
+#include "web_browser.h"
+#include "easy_mode.h"
 
-// 命令行 -h/--help
 static void printUsage() {
     CLR_INFO << "用法: ai-extract [选项]\n"
               << "  -o <dir>       输出目录\n"
@@ -31,7 +32,6 @@ static void printUsage() {
               << "  --task <cmd>   任务管理 (init / start <id> / stop / status)\n";
 }
 
-// 获取 exe 所在目录
 static std::string getExeDir() {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -40,7 +40,6 @@ static std::string getExeDir() {
     return (pos == std::string::npos) ? "." : s.substr(0, pos);
 }
 
-// 单次交互后处理任务状态
 static void handleTaskAfterProcessing(const std::string& clipboardText, Config& cfg) {
     std::string workDir = fullPath(cfg.outDir);
     std::string tasksPath = workDir + "\\.ai-extract\\tasks.json";
@@ -65,7 +64,6 @@ static void handleTaskAfterProcessing(const std::string& clipboardText, Config& 
                 << " | 子任务: " << stateBlock->currentSubtask 
                 << " | NEXT: " << stateBlock->next << "\n";
 
-    // 更新 active_context.md
     std::string oldCtx;
     if (fileExists(activeCtxPath)) {
         std::ifstream in(activeCtxPath);
@@ -78,7 +76,6 @@ static void handleTaskAfterProcessing(const std::string& clipboardText, Config& 
         out << newCtx;
     }
 
-    // 备份（每5轮）
     static int lastBackupStep = 0;
     if (stateBlock->step % 5 == 0 && stateBlock->step != lastBackupStep) {
         backupActiveContext(activeCtxPath, backupDir);
@@ -86,11 +83,9 @@ static void handleTaskAfterProcessing(const std::string& clipboardText, Config& 
         CLR_INFO << "[任务] 已自动备份 active_context.md\n";
     }
 
-    // 追加到全局记忆
     if (!stateBlock->facts.empty())
         appendToGlobalMemory(stateBlock->facts);
 
-    // 状态流转
     if (stateBlock->next == "TASK_COMPLETE" || stateBlock->next.empty()) {
         it->status = "done";
         activeTaskId = "";
@@ -156,7 +151,6 @@ int main(int argc, char* argv[]) {
     if (cmdNoBackup) cfg.noBackup = true;
     if (cmdDebug) cfg.debug = true;
 
-    // 处理 --task 命令行
     if (!taskCmd.empty()) {
         std::string workDir = fullPath(cfg.outDir);
         std::string aiDir = workDir + "\\.ai-extract";
@@ -182,7 +176,6 @@ int main(int argc, char* argv[]) {
                 CLR_ERROR << "[任务] 任务 ID " << arg << " 不存在。\n";
                 return 1;
             }
-            // 去除状态字符串的首尾空白后比较
             std::string st = trim(it->status);
             if (st == "done" || st == "abandoned") {
                 CLR_ERROR << "[任务] 任务 " << it->id << " 已完成或已放弃，无法再次启动。\n";
@@ -245,7 +238,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 文件输入模式
     if (!inputFile.empty()) {
         std::ifstream in(inputFile);
         if (!in) { CLR_ERROR << "无法打开文件: " << inputFile << "\n"; return 1; }
@@ -256,7 +248,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // 交互模式
     std::string mode;
     if (cmdAuto) mode = "auto";
     else if (cmdLoop) mode = "loop";
@@ -264,13 +255,15 @@ int main(int argc, char* argv[]) {
     else mode = "interactive";
 
     if (mode == "auto") {
-        std::string text;
-        try { text = readClipboard(); } catch (...) { CLR_ERROR << "读取剪贴板失败\n"; }
-        if (text.empty()) { CLR_WARN << "剪贴板为空\n"; }
+        std::string text = readClipboard();
+        if (text.empty()) {
+            CLR_WARN << "剪贴板为空\n";
+        }
         else if (text.size() > cfg.maxClipboardSize) {
             CLR_WARN << "剪贴板内容过大，已跳过。\n";
             writeLog(LogLevel::WARN, "Auto mode: clipboard too large");
-        } else {
+        }
+        else {
             auto dirs = parseDirectives(text);
             processDirectives(dirs, cfg);
             handleTaskAfterProcessing(text, cfg);
@@ -283,9 +276,11 @@ int main(int argc, char* argv[]) {
             std::getline(std::cin, userIn);
             userIn = trim(userIn);
             if (userIn.empty()) {
-                std::string text;
-                try { text = readClipboard(); } catch (const std::exception& e) { CLR_ERROR << "读取失败: " << e.what() << "\n"; continue; }
-                if (text.empty()) { CLR_WARN << "剪贴板为空\n"; continue; }
+                std::string text = readClipboard();
+                if (text.empty()) {
+                    CLR_WARN << "剪贴板为空\n";
+                    continue;
+                }
                 if (text.size() > cfg.maxClipboardSize) {
                     CLR_WARN << "剪贴板内容过大，已跳过。\n";
                     writeLog(LogLevel::WARN, "Clipboard too large, skipped.");
@@ -366,8 +361,7 @@ int main(int argc, char* argv[]) {
                     CLR_SUCCESS << "备份: " << (cfg.noBackup ? "关" : "开") << "\n";
                 }
                 else if (cmd == "auto") {
-                    std::string text;
-                    try { text = readClipboard(); } catch (...) { CLR_ERROR << "读取失败\n"; }
+                    std::string text = readClipboard();
                     if (!text.empty()) {
                         if (text.size() > cfg.maxClipboardSize) { CLR_WARN << "剪贴板内容过大，已跳过。\n"; }
                         else {
@@ -419,7 +413,6 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 else if (cmd == "quit") { quit = true; }
-                // 交互式任务命令
                 else if (cmd == "task") {
                     std::string workDir = fullPath(cfg.outDir);
                     std::string aiDir = workDir + "\\.ai-extract";
@@ -498,6 +491,46 @@ int main(int argc, char* argv[]) {
                     }
                     else {
                         CLR_WARN << "用法: :task init|start <id>|stop|status\n";
+                    }
+                }
+                else if (cmd == "browse") {
+                    if (arg.empty()) {
+                        CLR_WARN << "用法: :browse <url>\n";
+                    } else {
+                        std::string result = browsePage(arg, cfg.maxReadSize);
+                        if (result.find("Error:") == 0) {
+                            CLR_ERROR << result << "\n";
+                        } else {
+                            writeClipboard(result);
+                            CLR_SUCCESS << "[BROWSE] 内容已复制到剪贴板\n";
+                        }
+                    }
+                }
+                else if (cmd == "easy") {
+                    easyModeMenu(cfg);
+                }
+                // 新增 :next 命令
+                else if (cmd == "next") {
+                    std::string workDir = fullPath(cfg.outDir);
+                    std::string pcPath = workDir + "\\.ai-extract\\project_context.md";
+                    std::string activeCtxPath = workDir + "\\.ai-extract\\active_context.md";
+
+                    std::ostringstream combined;
+                    if (fileExists(pcPath)) {
+                        std::ifstream in(pcPath);
+                        combined << in.rdbuf();
+                        combined << "\n\n";
+                    }
+                    if (fileExists(activeCtxPath)) {
+                        std::ifstream in(activeCtxPath);
+                        combined << in.rdbuf();
+                    }
+                    std::string result = combined.str();
+                    if (result.empty()) {
+                        CLR_WARN << "[next] 没有可用的项目上下文或活动上下文。\n";
+                    } else {
+                        writeClipboard(result);
+                        CLR_SUCCESS << "[next] 已将下一轮对话上下文复制到剪贴板。\n";
                     }
                 }
                 else { CLR_WARN << "未知命令: " << cmd << "\n"; }

@@ -1,4 +1,3 @@
-// src/directiveproc.cpp
 #include "directiveproc.h"
 #include "config.h"
 #include "clipboard.h"
@@ -6,6 +5,7 @@
 #include "parser.h"
 #include "backup.h"
 #include "utils.h"
+#include "web_browser.h"
 #include <fstream>
 #include <sstream>
 
@@ -147,19 +147,53 @@ static void handleExecDirectives(const std::vector<FileDirective>& directives, c
     }
 }
 
+// ★ 修改点：对空 URL 增加明确警告
+static void handleBrowseDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
+    std::string combined;
+    bool first = true;
+    for (const auto& d : directives) {
+        if (d.type != FileDirective::BROWSE_PAGE) continue;
+        std::string url = trim(d.path);
+        if (url.empty()) {
+            CLR_WARN << "[BROWSE] 指令缺少 URL，已跳过。\n";
+            writeLog(LogLevel::WARN, "[BROWSE] Skipped directive with empty URL");
+            continue;
+        }
+        CLR_INFO << "[BROWSE] 正在浏览: " << url << "\n";
+        std::string result = browsePage(url, cfg.maxReadSize);
+        if (result.find("Error:") == 0) {
+            CLR_ERROR << "[BROWSE] " << result << "\n";
+            writeLog(LogLevel::ERROR, "[BROWSE] " + result);
+        } else {
+            CLR_SUCCESS << "[BROWSE] 获取成功 (" << result.size() << " 字符)\n";
+            writeLog(LogLevel::INFO, "[BROWSE] Fetched " + url + " (" + std::to_string(result.size()) + " chars)");
+            if (!first) combined += "\n\n---\n\n";
+            combined += "## 页面: " + url + "\n\n" + result;
+            first = false;
+        }
+    }
+    if (!combined.empty()) {
+        writeClipboard(combined);
+        CLR_SUCCESS << "[BROWSE] 内容已复制到剪贴板\n";
+    }
+}
+
 void processDirectives(const std::vector<FileDirective>& directives, const Config& cfg) {
     std::string baseDirAbs = fullPath(cfg.outDir);
-    int cCreate = 0, cRead = 0, cDelete = 0, cExec = 0;
+    int cCreate = 0, cRead = 0, cDelete = 0, cExec = 0, cBrowse = 0;
     for (auto& d : directives) {
         if (d.type == FileDirective::CREATE_FILE) cCreate++;
         else if (d.type == FileDirective::READ_FILE) cRead++;
         else if (d.type == FileDirective::DELETE_FILE) cDelete++;
         else if (d.type == FileDirective::EXEC_COMMAND) cExec++;
+        else if (d.type == FileDirective::BROWSE_PAGE) cBrowse++;
     }
-    if (cCreate + cRead + cDelete + cExec == 0) return;
-    CLR_INFO << "指令统计: 创建 " << cCreate << " 个, 读取 " << cRead << " 个, 删除 " << cDelete << " 个, 执行 " << cExec << " 个命令\n";
+    if (cCreate + cRead + cDelete + cExec + cBrowse == 0) return;
+    CLR_INFO << "指令统计: 创建 " << cCreate << " 个, 读取 " << cRead << " 个, 删除 " << cDelete 
+             << " 个, 执行 " << cExec << " 个, 浏览 " << cBrowse << " 个\n";
 
     if (cDelete > 0) handleDeleteDirectives(directives, baseDirAbs, cfg);
+    if (cBrowse > 0) handleBrowseDirectives(directives, cfg);
 
     std::vector<std::pair<std::string, std::string>> createFiles;
     for (auto& d : directives) {

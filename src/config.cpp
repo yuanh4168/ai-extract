@@ -30,6 +30,7 @@ bool Config::load(const std::string& path) {
         else if (key == "confirm_exec") confirmExec = (val == "1" || val == "true");
         else if (key == "max_clipboard_size") maxClipboardSize = std::stoul(val);
         else if (key == "max_read_size") maxReadSize = std::stoul(val);
+        else if (key == "easy_mode") easyMode = (val == "1" || val == "true");
     }
     return true;
 }
@@ -47,4 +48,5 @@ void Config::save(const std::string& path) const {
     out << "confirm_exec=" << (confirmExec ? "true" : "false") << "\n";
     out << "max_clipboard_size=" << maxClipboardSize << "\n";
     out << "max_read_size=" << maxReadSize << "\n";
+    out << "easy_mode=" << (easyMode ? "true" : "false") << "\n";
 }

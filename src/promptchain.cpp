@@ -2,90 +2,82 @@
 #include "utils.h"
 #include "clipboard.h"
 #include "pathutil.h"
+#include <fstream>
 #include <sstream>
+#include <windows.h>
 
-static const std::string DEFAULT_PROMPT_TEMPLATE = R"(
+static std::string loadPromptTemplate(const std::string& exeDir) {
+    std::string templatePath = exeDir + "\\prompt_template.md";
+    std::ifstream in(templatePath);
+    if (in) {
+        std::ostringstream oss;
+        oss << in.rdbuf();
+        std::string content = oss.str();
+        if (content.find("{{REQUIREMENTS}}") != std::string::npos)
+            return content;
+        else
+            return content + "\n{{REQUIREMENTS}}"; // 如果没有标记，添加到末尾
+    }
+    // 回退到硬编码的默认模板
+    return R"(
 你是一个严格遵循输出格式的代码生成与文件操作助手。你只能输出两类内容：回答用户问题和输出代码，每一次回答的正文部分只能包含上面的这两类别的其中一个，回答用户问题正常的回答，给出代码的部分必须且只能使用下述四种指令来响应，不能添加任何解释、说明、问候或 Markdown 装饰。整个回复由指令序列构成，指令之间由空行分隔。
 
 ## 指令语法
 
 ### 1. 创建/更新文件
-```
 ###FILE: 相对路径/文件名
 文件完整内容（可多行）
-```
+
+text
 
 - 路径使用正斜杠 `/`，相对于项目根目录。
 - 路径不得包含 `..` 或以 `/` 开头（绝对路径），否则会被拒绝。
 - 文件内容原样保留，包括缩进和空行。如果内容中包含三反引号，直接书写即可，工具会自动处理。
 
 ### 2. 读取文件内容到剪贴板
-```
 ###READ: 相对路径/文件名
-```
 
-- 工具会将对应文件的内容（或路径，取决于配置）复制到剪贴板，方便用户传给 AI。
+text
+
+- 工具会将对应文件的内容（或路径，取决于配置）复制到剪贴板。
 
 ### 3. 删除文件
-```
 ###DELETE: 相对路径/文件名
-```
+
+text
 
 - 工具会要求用户两次确认后才执行删除。
 
 ### 4. 执行命令行命令
-```
 ###EXEC:
-命令行指令（可多行，但通常一行即可）
-```
+命令行指令
 
-- 指令从 `###EXEC:` 后换行开始，直到下一个指令头或文件结束。
-- 常用于编译、运行代码。例如：
+text
 
-```
-###EXEC:
-g++ -std=c++17 -o program src/main.cpp && ./program
-```
+### 5. 浏览网页
+###BROWSE: URL
 
-- 工具会执行该命令，并将标准输出和标准错误合并后复制到剪贴板。退出码非零时会显示警告。
+text
 
 ## 格式约束
+- 整个回复中不能出现任何自然语言文本。
 
-- 每条指令必须以 `###FILE:`、`###READ:`、`###DELETE:` 或 `###EXEC:` 开头，且冒号后有一个空格（对于 FILE/READ/DELETE）或直接换行（对于 EXEC）。
-- 指令体结束后，下一个指令头或回复结束即为该指令的终止。
-- 如果你的回复中需要包含多个文件，请连续排列多个 `###FILE:` 指令。
-- **整个回复中不能出现任何自然语言文本、解释、问候、补充说明或 Markdown 代码块标记（如 ```）来包裹指令。**
-- 你可以建议用户将 `###EXEC` 放在 `###FILE` 之后，以确保文件已创建再执行。
-
-## 示例（正确的输出格式）
-
-```
-###FILE: src/main.cpp
-#include <iostream>
-int main() {
-    std::cout << "Hello";
-    return 0;
+## 当前需求：
+{{REQUIREMENTS}}
+)";
 }
 
-###FILE: README.md
-# My Project
-
-###EXEC:
-g++ -std=c++17 -o hello src/main.cpp && hello
-
-###READ: src/main.cpp
-```
-注意：以上示例中没有额外文字，这就是整个回复的全部内容。
-
-请严格遵循上述规则，根据用户需求生成对应的指令序列。
-
-当前需求：
-)";
-
 void promptChainMode(Config& cfg) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    std::string exeDir(exePath);
+    size_t lastSlash = exeDir.find_last_of("\\/");
+    if (lastSlash != std::string::npos) exeDir = exeDir.substr(0, lastSlash);
+
+    std::string promptTemplate = loadPromptTemplate(exeDir);
     std::vector<std::string> requirements;
+
     CLR_INFO << "=== 提示词链模式 ===\n";
-    CLR_INFO << "默认提示词模板:\n" << DEFAULT_PROMPT_TEMPLATE << "\n";
     CLR_INFO << "请输入你的第一条需求，或输入 :help 查看命令\n";
 
     while (true) {
@@ -107,14 +99,18 @@ void promptChainMode(Config& cfg) {
             } else if (cmd == "reset") {
                 requirements.clear(); CLR_SUCCESS << "需求已清空\n";
             } else if (cmd == "generate") {
-                std::ostringstream prompt;
-                prompt << DEFAULT_PROMPT_TEMPLATE;
-                for (auto& req : requirements) prompt << req << "\n";
+                std::string combinedReqs;
+                for (auto& req : requirements) combinedReqs += req + "\n";
+                std::string prompt = promptTemplate;
+                size_t pos = prompt.find("{{REQUIREMENTS}}");
+                if (pos != std::string::npos)
+                    prompt.replace(pos, std::string("{{REQUIREMENTS}}").length(), combinedReqs);
+                else
+                    prompt += "\n" + combinedReqs; // 保护措施
                 std::string tree = getDirectoryTree(fullPath(cfg.outDir));
-                if (!tree.empty()) {
-                    prompt << "\n当前项目的文件结构如下（供参考）：\n" << tree;
-                }
-                writeClipboard(prompt.str());
+                if (!tree.empty())
+                    prompt += "\n当前项目的文件结构如下（供参考）：\n" + tree;
+                writeClipboard(prompt);
             } else if (cmd == "tree") {
                 std::string tree = getDirectoryTree(fullPath(cfg.outDir));
                 if (tree.empty()) {

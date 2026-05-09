@@ -1,8 +1,8 @@
 #pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#undef ERROR   // windows.h 定义了 ERROR 宏，会干扰枚举
-#undef SUCCESS // 有些版本可能定义 SUCCESS
+#undef ERROR
+#undef SUCCESS
 
 #include <shellapi.h>
 #include <string>
@@ -31,7 +31,7 @@ enum class Color { WHITE=7, GREEN=10, YELLOW=14, RED=12, CYAN=11, MAGENTA=13 };
 enum class LogLevel { INFO, WARN, ERROR, SUCCESS };
 
 struct FileDirective {
-    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE, EXEC_COMMAND };
+    enum Type { CREATE_FILE, READ_FILE, DELETE_FILE, EXEC_COMMAND, BROWSE_PAGE };  // 新增 BROWSE_PAGE
     Type type;
     std::string path;
     std::string content;
