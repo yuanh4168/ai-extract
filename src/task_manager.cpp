@@ -94,7 +94,10 @@ std::vector<Task> loadTasks(const std::string& tasksPath, std::string& activeTas
 
 bool saveTasks(const std::string& tasksPath, const std::vector<Task>& tasks, const std::string& activeTaskId) {
     std::ofstream out(tasksPath);
-    if (!out) return false;
+    if (!out) {
+        writeLog(LogLevel::ERROR, "saveTasks: cannot open " + tasksPath);
+        return false;
+    }
     out << "{\n  \"version\": \"1.0\",\n  \"tasks\": [\n";
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& t = tasks[i];
@@ -125,15 +128,20 @@ bool saveTasks(const std::string& tasksPath, const std::vector<Task>& tasks, con
     out << "  ],\n";
     out << "  \"active_task_id\": " << (activeTaskId.empty() ? "null" : ("\"" + activeTaskId + "\"")) << "\n";
     out << "}\n";
-    return true;
+    bool ok = out.good();
+    if (!ok) writeLog(LogLevel::ERROR, "saveTasks: write failed for " + tasksPath);
+    return ok;
 }
 
-// ============ STATE_BLOCK 提取（修复 Windows \r\n） ============
+// ============ STATE_BLOCK 提取（增强容错与日志） ============
 std::optional<StateBlock> extractStateBlock(const std::string& text) {
-    // 使用 [\r\n]+ 匹配一个或多个换行符，兼容 Windows 和 Unix
-    std::regex re(R"(\s*###\s*STATE_BLOCK\s*[\r\n]+([\s\S]*?)###\s*END_STATE)", std::regex::ECMAScript);
+    // 允许 STATE_BLOCK 前后有空白，内部换行兼容 Windows/Linux
+    std::regex re(R"(###\s*STATE_BLOCK\s*\r?\n([\s\S]*?)###\s*END_STATE)", std::regex::ECMAScript);
     std::smatch match;
-    if (!std::regex_search(text, match, re)) return std::nullopt;
+    if (!std::regex_search(text, match, re)) {
+        writeLog(LogLevel::WARN, "extractStateBlock: no match found");
+        return std::nullopt;
+    }
     std::string block = match[1].str();
     StateBlock sb;
     auto extractLine = [&](const std::string& key) -> std::string {
@@ -142,7 +150,17 @@ std::optional<StateBlock> extractStateBlock(const std::string& text) {
         if (std::regex_search(block, m, lineRe)) return m[1].str();
         return "";
     };
-    try { sb.step = std::stoi(extractLine("STEP")); } catch (...) { return std::nullopt; }
+    try {
+        std::string stepStr = extractLine("STEP");
+        if (stepStr.empty()) {
+            writeLog(LogLevel::ERROR, "extractStateBlock: STEP missing");
+            return std::nullopt;
+        }
+        sb.step = std::stoi(stepStr);
+    } catch (...) {
+        writeLog(LogLevel::ERROR, "extractStateBlock: STEP not an integer");
+        return std::nullopt;
+    }
     sb.currentSubtask = extractLine("CURRENT_SUBTASK");
     sb.outcome = extractLine("OUTCOME");
     std::string factsLine = extractLine("FACTS");
@@ -155,6 +173,7 @@ std::optional<StateBlock> extractStateBlock(const std::string& text) {
         }
     }
     sb.next = extractLine("NEXT");
+    writeLog(LogLevel::INFO, "extractStateBlock: step=" + std::to_string(sb.step) + " next=" + sb.next);
     return sb;
 }
 
@@ -184,8 +203,7 @@ std::string generateInitialActiveContext(const Task& task) {
 
 std::string applyStateBlock(const std::string& oldContext, const StateBlock& block) {
     std::string ctx = oldContext;
-    // 同样使用 [\r\n] 匹配换行
-    std::regex re(R"(\s*###\s*STATE_BLOCK\s*[\r\n]+[\s\S]*?###\s*END_STATE)", std::regex::ECMAScript);
+    std::regex re(R"(###\s*STATE_BLOCK\s*\r?\n[\s\S]*?###\s*END_STATE)", std::regex::ECMAScript);
     std::ostringstream newBlock;
     newBlock << "### STATE_BLOCK\n";
     newBlock << "STEP: " << block.step << "\n";
@@ -200,6 +218,7 @@ std::string applyStateBlock(const std::string& oldContext, const StateBlock& blo
     newBlock << "NEXT: " << block.next << "\n";
     newBlock << "### END_STATE";
     ctx = std::regex_replace(ctx, re, newBlock.str());
+    writeLog(LogLevel::INFO, "applyStateBlock: updated STEP to " + std::to_string(block.step));
     return ctx;
 }
 
