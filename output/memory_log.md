@@ -1,39 +1,19 @@
 # 记忆日志
 
 
-## 2026-05-08 20:29
-- 控制台报错: TypeError: undefined is not a function
-- 仅在 Chrome v120+ 出现
 
-## 2026-05-08 20:30
-- 问题代码位置: src/utils.js 第45行
-- 需要降级为传统 &&
+## 2026-05-10 14:22
+- NEXT: 实现主窗口创建和消息循环
 
-## 2026-05-08 20:30
-- 修复提交: commit abc123
+## 2026-05-10 14:27
+- 使用Win32 API CreateWindowEx创建按钮
+- 使用DrawText绘制数字，需自定义字体
+- 窗口过程通过WM_COMMAND响应按钮
+- 全局时间字符串g_timeText用于刷新显示
 
-## 2026-05-08 20:30
-- 性能无劣化
-
-## 2026-05-10 00:24
-- 使用Win32原生API实现轻量级倒计时器，无外部依赖
-- 采用SetTimer每秒触发更新显示
-- 全局变量管理状态(剩余秒数g_remaining、运行标志g_running、暂停标志g_paused)
-- 按钮文本动态切换开始/暂停/继续
-- 输入限制为纯数字，最大359999秒(约99小时)
-
-## 2026-05-10 00:29
-- 编译命令使用g++ -static -mwindows确保无控制台窗口
-- 若未安装g++将编译失败
-
-## 2026-05-10 00:30
-- 之前的 EXEC 指令被用户直接粘贴导致 '###' 错误
-- 使用批处理自动选择编译器
-- MSVC 编译需指定 /SUBSYSTEM:WINDOWS 避免控制台窗口
-- MinGW 使用 -mwindows 同样效果
-
-## 2026-05-10 00:35
-- 之前的 EXEC 指令被用户直接粘贴导致 '###' 错误
-- 使用批处理自动选择编译器
-- MSVC 编译需指定 /SUBSYSTEM:WINDOWS 避免控制台窗口
-- MinGW 使用 -mwindows 同样效果
+## 2026-05-10 14:30
+- 使用SetTimer和WM_TIMER实现每秒tick
+- CountdownTimer类封装状态和剩余秒数
+- WM_CREATE中初始化Timer，WM_DESTROY中清理
+- 倒计时至0时自动停止并弹出提示
+- 暂停时KillTimer停止刷新，开始时SetTimer重新启动

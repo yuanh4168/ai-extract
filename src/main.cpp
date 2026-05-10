@@ -105,6 +105,59 @@ static void handleTaskAfterProcessing(const std::string& clipboardText, Config& 
     saveTasks(tasksPath, tasks, activeTaskId);
 }
 
+// 自动初始化并启动第一个任务（如果存在 tasks.json 且无活动任务）
+static void autoInitAndStart(Config& cfg) {
+    std::string workDir = fullPath(cfg.outDir);
+    std::string aiDir = workDir + "\\.ai-extract";
+    std::string tasksPath = aiDir + "\\tasks.json";
+    if (!fileExists(tasksPath)) return;                     // 没有任务文件
+    std::string activeTaskId;
+    auto tasks = loadTasks(tasksPath, activeTaskId);
+    if (!activeTaskId.empty()) return;                      // 已有活动任务
+    if (tasks.empty()) return;                              // 无任务
+
+    // 找到第一个状态为 new 的任务，按优先级排序：high > medium > low，同优先级取第一个
+    Task* target = nullptr;
+    for (auto& t : tasks) {
+        if (t.status == "new") {
+            if (!target ||
+                (t.priority == "high" && target->priority != "high") ||
+                (t.priority == "medium" && target->priority == "low")) {
+                target = &t;
+            }
+        }
+    }
+    if (!target) return;                                    // 没有可启动的任务
+
+    // 检查依赖
+    for (auto& dep : target->depends_on) {
+        auto it = std::find_if(tasks.begin(), tasks.end(), [&](const Task& t) {
+            return t.id == dep && t.status == "done";
+        });
+        if (it == tasks.end()) return;                      // 依赖未满足
+    }
+
+    // 启动任务
+    target->status = "in_progress";
+    activeTaskId = target->id;
+    saveTasks(tasksPath, tasks, activeTaskId);
+    std::string ctx = generateInitialActiveContext(*target);
+    std::string activeCtxPath = aiDir + "\\active_context.md";
+    std::ofstream out(activeCtxPath);
+    out << ctx;
+
+    // 生成提示词并复制到剪贴板
+    std::string pcPath = aiDir + "\\project_context.md";
+    std::ostringstream prompt;
+    if (fileExists(pcPath)) {
+        std::ifstream in(pcPath);
+        prompt << in.rdbuf() << "\n\n";
+    }
+    prompt << ctx;
+    writeClipboard(prompt.str());
+    CLR_SUCCESS << "[自动] 已启动任务 " << target->id << "，上下文已复制到剪贴板。\n";
+}
+
 // 新增：生成下一轮对话的上下文（合并 project_context.md 和 active_context.md）
 static std::string generateNextContext(const Config& cfg) {
     std::string pcPath = fullPath(cfg.outDir) + "\\.ai-extract\\project_context.md";
@@ -272,6 +325,15 @@ int main(int argc, char* argv[]) {
     else if (configLoaded) mode = cfg.defaultMode;
     else mode = "interactive";
 
+    // 如果设置了 easy_mode 且在交互模式下，自动进入简易模式
+    if (mode == "interactive" && cfg.easyMode) {
+        easyModeMenu(cfg);
+        cfg.save(configPath);
+        std::cout << "程序结束，按回车键退出...";
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        return 0;
+    }
+
     if (mode == "auto") {
         std::string text = readClipboard();
         if (text.empty()) {
@@ -285,12 +347,21 @@ int main(int argc, char* argv[]) {
             auto dirs = parseDirectives(text);
             std::string outputAccum = processDirectives(dirs, cfg);
             handleTaskAfterProcessing(text, cfg);
-            // 统一缓冲区：合并任务上下文
+            autoInitAndStart(cfg);  // 自动启动任务
             std::string ctx = generateNextContext(cfg);
             if (!ctx.empty()) {
-                if (!outputAccum.empty()) outputAccum += "\n---\n";
-                outputAccum += ctx;
+                if (!outputAccum.empty()) {
+                    CLR_INFO << "[输出] 指令输出 " << outputAccum.size() << " 字节\n";
+                    CLR_INFO << "[上下文] 项目上下文 " << ctx.size() << " 字节\n";
+                    CLR_SUCCESS << "[组合] 合并输出与上下文，准备复制到剪贴板...\n";
+                    outputAccum += "\n---\n" + ctx;
+                } else {
+                    outputAccum = ctx;
+                }
+            } else {
+                CLR_WARN << "[上下文] 未生成额外上下文。\n";
             }
+            CLR_SUCCESS << "[剪贴板] 总内容 " << outputAccum.size() << " 字节已复制。\n";
             writeClipboard(outputAccum);
         }
     } else {
@@ -315,12 +386,22 @@ int main(int argc, char* argv[]) {
                 auto dirs = parseDirectives(text);
                 std::string outputAccum = processDirectives(dirs, cfg);
                 handleTaskAfterProcessing(text, cfg);
-                // 统一缓冲区：合并任务上下文
+                autoInitAndStart(cfg);  // 自动启动任务
+                // 统一缓冲区：合并任务上下文，并彩色显示
                 std::string ctx = generateNextContext(cfg);
                 if (!ctx.empty()) {
-                    if (!outputAccum.empty()) outputAccum += "\n---\n";
-                    outputAccum += ctx;
+                    if (!outputAccum.empty()) {
+                        CLR_INFO << "[输出] 指令输出 " << outputAccum.size() << " 字节\n";
+                        CLR_INFO << "[上下文] 项目上下文 " << ctx.size() << " 字节\n";
+                        CLR_SUCCESS << "[组合] 合并输出与上下文，准备复制到剪贴板...\n";
+                        outputAccum += "\n---\n" + ctx;
+                    } else {
+                        outputAccum = ctx;
+                    }
+                } else {
+                    CLR_WARN << "[上下文] 未生成额外上下文。\n";
                 }
+                CLR_SUCCESS << "[剪贴板] 总内容 " << outputAccum.size() << " 字节已复制。\n";
                 writeClipboard(outputAccum);
                 continue;
             }
@@ -400,11 +481,21 @@ int main(int argc, char* argv[]) {
                             auto dirs = parseDirectives(text);
                             std::string outputAccum = processDirectives(dirs, cfg);
                             handleTaskAfterProcessing(text, cfg);
+                            autoInitAndStart(cfg);
                             std::string ctx = generateNextContext(cfg);
                             if (!ctx.empty()) {
-                                if (!outputAccum.empty()) outputAccum += "\n---\n";
-                                outputAccum += ctx;
+                                if (!outputAccum.empty()) {
+                                    CLR_INFO << "[输出] 指令输出 " << outputAccum.size() << " 字节\n";
+                                    CLR_INFO << "[上下文] 项目上下文 " << ctx.size() << " 字节\n";
+                                    CLR_SUCCESS << "[组合] 合并输出与上下文，准备复制到剪贴板...\n";
+                                    outputAccum += "\n---\n" + ctx;
+                                } else {
+                                    outputAccum = ctx;
+                                }
+                            } else {
+                                CLR_WARN << "[上下文] 未生成额外上下文。\n";
                             }
+                            CLR_SUCCESS << "[剪贴板] 总内容 " << outputAccum.size() << " 字节已复制。\n";
                             writeClipboard(outputAccum);
                         }
                     }

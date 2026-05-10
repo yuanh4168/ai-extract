@@ -23,7 +23,6 @@ struct MenuNode {
     bool isAction = false;
 };
 
-// 获取可执行文件所在目录
 static std::string getAiExtractExeDir() {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -45,7 +44,6 @@ static void drawMenu(const std::vector<MenuNode>& nodes, int selected) {
     std::cout << std::flush;
 }
 
-// 通用列表选择器，返回被选中的字符串，若取消返回空串
 static std::string selectFromList(const std::vector<std::string>& items, const std::string& title) {
     if (items.empty()) return "";
     int selected = 0;
@@ -88,6 +86,7 @@ static bool navigate(Config& cfg, std::vector<MenuNode>& currentLevel) {
             MenuNode& node = currentLevel[selected];
             if (node.isAction) {
                 if (node.action) node.action(cfg);
+                drawMenu(currentLevel, selected);
             } else if (!node.children.empty()) {
                 if (!navigate(cfg, node.children)) {
                     return false;
@@ -103,7 +102,6 @@ static bool navigate(Config& cfg, std::vector<MenuNode>& currentLevel) {
 }
 
 void easyModeMenu(Config& cfg) {
-    // 构建根菜单
     std::vector<MenuNode> root = {
         {
             "创建文件",
@@ -220,16 +218,17 @@ void easyModeMenu(Config& cfg) {
             },
             true
         },
-        // 新增：启动新项目（提示词链）
         {
             "启动新项目（生成提示词）",
             {},
             [&](Config& c) {
                 promptChainMode(c);
+                // 等待用户按键后再返回菜单，避免提示被立刻覆盖
+                CLR_INPUT << "\n按任意键返回简易菜单...";
+                _getch();
             },
             true
         },
-        // 新增：项目任务维护
         {
             "项目任务维护",
             {
@@ -358,6 +357,62 @@ void easyModeMenu(Config& cfg) {
                             writeClipboard(result);
                             CLR_SUCCESS << "下一轮对话上下文已复制到剪贴板。\n按任意键继续...";
                         }
+                        _getch();
+                    },
+                    true
+                },
+                {"返回", {}, [](Config&){}, true}
+            },
+            nullptr,
+            false
+        },
+        {
+            "项目设置",
+            {
+                {
+                    "修改输出目录",
+                    {},
+                    [&](Config& c) {
+                        CLR_INPUT << "新目录: ";
+                        std::string dir; std::getline(std::cin, dir);
+                        if (!dir.empty()) {
+                            c.outDir = dir;
+                            CLR_SUCCESS << "输出目录已更改为: " << fullPath(dir) << "\n";
+                        }
+                        CLR_INPUT << "\n按任意键继续...";
+                        _getch();
+                    },
+                    true
+                },
+                {
+                    "切换强制覆盖",
+                    {},
+                    [&](Config& c) {
+                        c.force = !c.force;
+                        CLR_SUCCESS << "强制覆盖: " << (c.force ? "开" : "关") << "\n";
+                        CLR_INPUT << "\n按任意键继续...";
+                        _getch();
+                    },
+                    true
+                },
+                {
+                    "切换备份",
+                    {},
+                    [&](Config& c) {
+                        c.noBackup = !c.noBackup;
+                        CLR_SUCCESS << "备份: " << (c.noBackup ? "关" : "开") << "\n";
+                        CLR_INPUT << "\n按任意键继续...";
+                        _getch();
+                    },
+                    true
+                },
+                {
+                    "切换调试模式",
+                    {},
+                    [&](Config& c) {
+                        c.debug = !c.debug;
+                        CLR_SUCCESS << "调试模式: " << (c.debug ? "开" : "关") << "\n";
+                        CLR_INPUT << "\n按任意键继续...";
                         _getch();
                     },
                     true
